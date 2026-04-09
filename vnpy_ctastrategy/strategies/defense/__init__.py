@@ -1,0 +1,1 @@
+from .simple_defense import SimpleDefenseStrategy
