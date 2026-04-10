@@ -1,3 +1,5 @@
+import re
+from enum import Enum
 from typing import List, Dict, Tuple, Callable, Optional
 from datetime import datetime, date
 from copy import copy
@@ -5,93 +7,138 @@ from vnpy.trader.object import BarData
 from vnpy.trader.database import get_database, BaseDatabase
 
 
-class ContinuousBuilder:
-    """连续合约与路由表生成器 (机构级)"""
+class AdjustMode(Enum):
+    """复权模式配置"""
+    ABSOLUTE = "absolute"  # 绝对值复权 (加减差价)
+    RATIO = "ratio"  # 等比复权 (乘除比例) - 主流机构推荐
 
-    def __init__(self, output: Callable):
+
+class ContinuousBuilder:
+    """机构级：连续合约与动态路由生成器"""
+
+    def __init__(self, output: Callable, adjust_mode: AdjustMode = AdjustMode.RATIO):
         self.output = output
+        self.adjust_mode = adjust_mode  # 默认使用机构级的等比复权
         self.raw_bars: Dict[str, List[BarData]] = {}
 
-    def _calculate_active_symbols(self, daily_close_oi: Dict[date, Dict[str, int]]) -> Dict[date, str]:
+    def _get_delivery_year_month(self, symbol: str) -> Tuple[int, int]:
+        """解析合约的交割年份与月份 (例如 'rb2605' -> 2026, 5)"""
+        match = re.search(r'\d+', symbol)
+        if match:
+            digits = match.group()
+            if len(digits) == 4:
+                return 2000 + int(digits[:2]), int(digits[2:])
+            elif len(digits) == 3:  # 兼容郑商所旧规则 (如 TA605 -> 26年5月)
+                return 2020 + int(digits[0]), int(digits[1:])
+        return 2099, 12  # 解析失败则默认远期
+
+    def _calculate_active_symbols(self, daily_stats: Dict[date, Dict[str, dict]]) -> Dict[date, str]:
         """
-        核心换月逻辑 (独立抽离)：
-        1. 首次上市：以首日收盘持仓量最大者作为初始主力。
-        2. 换月阈值：同品种其他合约收盘持仓量 > 当前主力持仓量 * 1.1。
-        3. 换月生效：次日生效（日内绝对不换月）。
+        三维机构级换月路由：
+        1. 流动性双重验证：持仓量 > 1.1倍 且 成交量 > 1.2倍。
+        2. 涨跌停防御：新合约 High == Low 时拒绝换月。
+        3. 临期强制逃亡：进入交割前1个月，无视阈值强制切向最高流动性远月。
         """
-        sorted_dates: List[date] = sorted(list(daily_close_oi.keys()))
+        sorted_dates: List[date] = sorted(list(daily_stats.keys()))
         daily_active_symbol: Dict[date, str] = {}
         current_active: Optional[str] = None
 
         for d in sorted_dates:
-            oi_dict: Dict[str, int] = daily_close_oi[d]
+            stats_dict = daily_stats[d]
 
             if current_active is None:
-                # 初始确立：首次上市，选当日最大OI
-                current_active = max(oi_dict, key=oi_dict.get)
+                current_active = max(stats_dict.keys(), key=lambda s: stats_dict[s]['oi'])
                 daily_active_symbol[d] = current_active
-                self.output(f"[{d}] 首次确立初始主力合约: {current_active}")
-            else:
-                # 今日沿用昨日决定的主力合约（确保日内不切换）
-                daily_active_symbol[d] = current_active
+                self.output(f"[{d}] 🏁 初始确立主力合约: {current_active}")
+                continue
+
+            # 日内不切，沿用昨天决定的主力
+            daily_active_symbol[d] = current_active
 
             # ==========================================
-            # 在今日收盘时，评估是否需要为【下一交易日】切换主力
+            # 每日收盘后，评估是否触发换月 (次日生效)
             # ==========================================
-            current_active_oi: int = oi_dict.get(current_active, 0)
+            cur_stats = stats_dict.get(current_active, {'oi': 0, 'vol': 0})
+            current_oi, current_vol = cur_stats['oi'], cur_stats['vol']
 
-            # 找到今日收盘时，持仓量最大的合约
-            best_sym: str = max(oi_dict, key=oi_dict.get)
-            best_oi: int = oi_dict.get(best_sym, 0)
+            # 寻找当下 OI 最大的合约作为潜在目标
+            best_sym = max(stats_dict.keys(), key=lambda s: stats_dict[s]['oi'])
+            best_stats = stats_dict[best_sym]
 
-            # 触发条件：非当前主力，且持仓量超过当前主力的 1.1 倍
-            if best_sym != current_active and best_oi > current_active_oi * 1.1:
-                self.output(
-                    f"[{d} 收盘] 触发换月信号 🔄 : {best_sym} 持仓量({best_oi}) 已超过原主力 {current_active}({current_active_oi}) 的1.1倍。")
-                self.output(f"  -> 将于下一交易日正式切换为主力。")
-                # 更新 current_active，它将在下一天 (下一轮循环) 生效
-                current_active = best_sym
+            if best_sym == current_active:
+                continue
+
+            # 1. 涨跌停流动性检验
+            is_liquid = (best_stats['high'] != best_stats['low']) and (best_stats['vol'] > 0)
+
+            # 2. 交割期强制逃亡检验 (临近1个月)
+            del_year, del_month = self._get_delivery_year_month(current_active)
+            is_expiring = (d.year > del_year) or (d.year == del_year and d.month >= del_month - 1)
+
+            # 换月决策树
+            if is_expiring and is_liquid:
+                # 临近交割，只要远月比现在的废壳大，赶紧跑！
+                if best_stats['oi'] > current_oi:
+                    self.output(f"[{d} 收盘] 🚨 触发强制移仓 (进入交割月): {current_active} -> {best_sym}")
+                    current_active = best_sym
+
+            elif is_liquid:
+                # 正常时期：OI超1.1倍 且 成交量超1.2倍 才算真实主力资金移库
+                if best_stats['oi'] > current_oi * 1.1 and best_stats['vol'] > current_vol * 1.2:
+                    self.output(f"[{d} 收盘] 🔄 触发量价换月: {best_sym} (持仓/成交已全面反超)")
+                    current_active = best_sym
 
         return daily_active_symbol
 
     def load_and_build(self, physical_symbols: List[str], exchange, interval: str, start: datetime,
                        end: datetime) -> Tuple[List[BarData], Dict[datetime, str], Dict[Tuple[str, datetime], BarData]]:
 
+        self.output(f"启动构建，复权模式: {self.adjust_mode.value.upper()}")
         database: BaseDatabase = get_database()
         physical_bars_dict: Dict[Tuple[str, datetime], BarData] = {}
 
-        # 1. 从数据库拉取所有物理合约
+        # 1. 加载数据并实施极简清洗
         for p_symbol in physical_symbols:
-            self.output(f"正在拉取底层物理合约: {p_symbol}")
             req_symbol: str = p_symbol.split(".")[0]
-
             bars: List[BarData] = database.load_bar_data(req_symbol, exchange, interval, start, end)
             if bars:
-                self.raw_bars[p_symbol] = bars
-                for bar in bars:
+                # 简单清洗：过滤掉极度异常的错价包 (价格<=0)
+                clean_bars = [b for b in bars if b.low_price > 0 and b.high_price > 0]
+                self.raw_bars[p_symbol] = clean_bars
+                for bar in clean_bars:
                     physical_bars_dict[(p_symbol, bar.datetime)] = bar
 
         if not self.raw_bars:
             return [], {}, {}
 
-        # 2. 梳理每日收盘持仓量 (OI)，并调用独立换月逻辑
-        self.output("正在扫描每日收盘持仓量，计算主力换月路径...")
-        daily_close_oi: Dict[date, Dict[str, int]] = {}
-
+        # 2. 梳理每日多维度特征，送入路由引擎
+        daily_stats: Dict[date, Dict[str, dict]] = {}
         for sym, bars in self.raw_bars.items():
             for bar in bars:
                 d: date = bar.datetime.date()
-                if d not in daily_close_oi:
-                    daily_close_oi[d] = {}
-                # 由于加载的历史K线是按时间正序排列的，
-                # 同一日期的最后一个 bar.open_interest 就会自然覆盖前面的，从而得到收盘持仓量
-                daily_close_oi[d][sym] = bar.open_interest
+                if d not in daily_stats:
+                    daily_stats[d] = {}
+                # 同一日期的最后一根 Bar 会覆盖，从而得到收盘数据和全天极大/极小值
+                if sym not in daily_stats[d]:
+                    daily_stats[d][sym] = {
+                        'oi': 0,
+                        'vol': 0,
+                        'high': bar.high_price,
+                        'low': bar.low_price,
+                        'close': bar.close_price
+                    }
 
-        # 调用独立方法生成主力日历
-        daily_active_symbol = self._calculate_active_symbols(daily_close_oi)
+                ds = daily_stats[d][sym]
+                ds['oi'] = bar.open_interest  # 收盘OI
+                ds['vol'] += bar.volume  # 累加日内Volume
+                ds['high'] = max(ds['high'], bar.high_price)
+                ds['low'] = min(ds['low'], bar.low_price)
+                ds['close'] = bar.close_price  # 最终收盘价
 
-        # 3. 拼接并复权
-        self.output("正在拼接K线，并进行基差【前复权】处理...")
+        daily_active_symbol = self._calculate_active_symbols(daily_stats)
+
+        # 3. 核心复权拼接逻辑
+        self.output("正在拼接K线并应用前复权...")
         continuous_bars: List[BarData] = []
         routing_schedule: Dict[datetime, str] = {}
 
@@ -100,51 +147,66 @@ class ContinuousBuilder:
             all_bars_flat.extend(bars)
         all_bars_flat.sort(key=lambda x: x.datetime)
 
-        cumulative_adjustment: float = 0.0
+        cumulative_diff: float = 0.0  # 绝对值复权累积
+        cumulative_ratio: float = 1.0  # 等比复权累积
         last_active: Optional[str] = None
         last_close_for_old: float = 0.0
 
-        # 第一阶段：按时间线计算跳空缺口（计算后复权偏移量）
+        # 阶段一：顺时针抹平历史 (后复权锚定起点)
         for bar in all_bars_flat:
             d: date = bar.datetime.date()
             active_sym: str = daily_active_symbol.get(d, "")
             routing_schedule[bar.datetime] = active_sym
 
             if bar.symbol == active_sym.split('.')[0]:
-                if last_active and active_sym != last_active:
-                    # 发生换月，计算跳空缺口 (新合约开盘 - 老合约真实收盘)
-                    spread: float = bar.open_price - last_close_for_old
-                    cumulative_adjustment += spread
+                if last_active and active_sym != last_active and last_close_for_old > 0:
+                    # 发生换月，计算跳空 (新开 - 老收)
+                    if self.adjust_mode == AdjustMode.ABSOLUTE:
+                        spread = bar.open_price - last_close_for_old
+                        cumulative_diff += spread
+                    elif self.adjust_mode == AdjustMode.RATIO:
+                        ratio = bar.open_price / last_close_for_old
+                        cumulative_ratio *= ratio
 
                 adj_bar: BarData = copy(bar)
                 adj_bar.symbol = "CONTINUOUS"
 
-                # 暂时向下平移消除缺口
-                adj_bar.open_price -= cumulative_adjustment
-                adj_bar.high_price -= cumulative_adjustment
-                adj_bar.low_price -= cumulative_adjustment
-                adj_bar.close_price -= cumulative_adjustment
+                # 应用当前累计调整
+                if self.adjust_mode == AdjustMode.ABSOLUTE:
+                    adj_bar.open_price -= cumulative_diff
+                    adj_bar.high_price -= cumulative_diff
+                    adj_bar.low_price -= cumulative_diff
+                    adj_bar.close_price -= cumulative_diff
+                elif self.adjust_mode == AdjustMode.RATIO:
+                    adj_bar.open_price /= cumulative_ratio
+                    adj_bar.high_price /= cumulative_ratio
+                    adj_bar.low_price /= cumulative_ratio
+                    adj_bar.close_price /= cumulative_ratio
 
                 continuous_bars.append(adj_bar)
                 last_active = active_sym
                 last_close_for_old = bar.close_price
 
-        # 第二阶段：O(N) 极速转为【前复权】并进行负价预警检查
-        if continuous_bars and cumulative_adjustment != 0:
-            has_alerted_negative = False
+        # 阶段二：O(N) 极速转【前复权】
+        # 将所有历史数据反向抬高/放大，使最新K线完美对齐真实物理盘口
+        has_alerted_negative = False
 
+        if continuous_bars:
             for c_bar in continuous_bars:
-                # 将累积的总偏差整体抬高，使得最新的一根K线完美对齐真实物理盘口
-                c_bar.open_price += cumulative_adjustment
-                c_bar.high_price += cumulative_adjustment
-                c_bar.low_price += cumulative_adjustment
-                c_bar.close_price += cumulative_adjustment
+                if self.adjust_mode == AdjustMode.ABSOLUTE and cumulative_diff != 0:
+                    c_bar.open_price += cumulative_diff
+                    c_bar.high_price += cumulative_diff
+                    c_bar.low_price += cumulative_diff
+                    c_bar.close_price += cumulative_diff
 
-                # 【新增】：价格异常检查
-                if not has_alerted_negative and c_bar.low_price <= 0:
-                    self.output(f"⚠️ 警告: 发现连续合约中出现异常价格！(例如 {c_bar.datetime} 的最低价跌至 {c_bar.low_price:.2f})")
-                    self.output(f"⚠️ 原因: 该品种可能处于长期深度升水，进行绝对值【前复权】时，早年历史价格被过度向下平移导致穿透零轴。")
-                    self.output(f"⚠️ 建议: 若您的技术指标(如ATR/RSI)报错，请考虑忽略或更换等比复权。")
-                    has_alerted_negative = True  # 只打印一次，防止日志刷屏
+                    if not has_alerted_negative and c_bar.low_price < 0:
+                        self.output(f"⚠️ 绝对复权负价警告: {c_bar.datetime} 最低价跌穿零轴({c_bar.low_price:.2f})！建议切换为等比复权。")
+                        has_alerted_negative = True
+
+                elif self.adjust_mode == AdjustMode.RATIO and cumulative_ratio != 1.0:
+                    c_bar.open_price *= cumulative_ratio
+                    c_bar.high_price *= cumulative_ratio
+                    c_bar.low_price *= cumulative_ratio
+                    c_bar.close_price *= cumulative_ratio
 
         return continuous_bars, routing_schedule, physical_bars_dict

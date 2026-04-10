@@ -1,4 +1,8 @@
-# 忽略 Python 字节码缓存目录
-__pycache__/
-*.pyc
-*.pyo
+# 忽略所有层级下的 __pycache__ 目录
+**/__pycache__/
+
+# 忽略所有层级下的字节码文件
+*.py[cod]
+
+# 忽略 Python 动态库
+*.so
