@@ -23,6 +23,11 @@ from .template import CtaTemplate
 from .locale import _
 from .continuous_builder import ContinuousBuilder
 
+# 🟢 导入可热插拔的模块接口与 V1 默认实现
+from .backtesting_modules import (BaseMarginModel, BaseSlippageModel, BaseExecutionModel, BaseCommissionModel,
+                                  V1DefaultMarginModel, V1DefaultSlippageModel, V1DefaultExecutionModel,
+                                  V1DefaultCommissionModel)
+
 
 class BacktestingEngine:
     """"""
@@ -46,6 +51,7 @@ class BacktestingEngine:
         self.annual_days: int = 240
         self.half_life: int = 120
         self.mode: BacktestingMode = BacktestingMode.BAR
+        self.by_volume: bool = False  # 🟢 暴露按手收费参数
 
         self.strategy_class: type[CtaTemplate]
         self.strategy: CtaTemplate
@@ -74,15 +80,18 @@ class BacktestingEngine:
         self.daily_results: dict[Date, 'DailyResult'] = {}
         self.daily_df: DataFrame = DataFrame()
 
-        # --- 物理账本与路由变量 ---
         self.physical_symbols = []
         self.physical_bars = {}
         self.physical_positions = {}
         self.routing_schedule = {}
         self.current_physical_symbol = ""
 
-        # 性能优化：字符串操作缓存
         self._symbol_cache = {}
+
+        self.margin_model: BaseMarginModel = None
+        self.slippage_model: BaseSlippageModel = None
+        self.execution_model: BaseExecutionModel = None
+        self.commission_model: BaseCommissionModel = None
 
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
@@ -97,6 +106,9 @@ class BacktestingEngine:
         self.logs.clear()
         self.daily_results.clear()
 
+        # 🟢 清空 DataFrame 缓存，不再重复导入
+        self.daily_df = DataFrame()
+
         self.physical_positions.clear()
         self.current_physical_symbol = ""
         self.routing_schedule.clear()
@@ -104,37 +116,35 @@ class BacktestingEngine:
         self._symbol_cache.clear()
 
     def _normalize_vt_symbol(self, symbol: str) -> str:
-        """统一物理合约与虚拟合约的格式后缀，带字典缓存以应对 Tick 级极高频调用"""
         if not symbol:
             return ""
-
         if symbol in self._symbol_cache:
             return self._symbol_cache[symbol]
 
         if "." not in symbol:
-            # 撤销 symbol.upper()，保留原始大小写（如 rb, IF 等）
             result = f"{symbol}.{self.exchange.value}"
         else:
             parts = symbol.split(".")
-            # 前缀保留原样，只将交易所后缀强制转大写
             result = f"{parts[0]}.{parts[1].upper()}"
 
         self._symbol_cache[symbol] = result
         return result
 
     def _get_trading_date(self, dt: datetime) -> Date:
-        """
-        期货夜盘交易日映射逻辑。
-        将 20:00 之后的夜盘时间映射到下一个交易日。
-        （如遇周五夜盘，映射至下周一）
-        """
         if dt.hour >= 20:
-            if dt.weekday() == 4:  # 周五夜盘归属周一
+            if dt.weekday() == 4:
                 return (dt + timedelta(days=3)).date()
-            elif dt.weekday() == 5:  # 周六凌晨防错
+            elif dt.weekday() == 5:
                 return (dt + timedelta(days=2)).date()
             else:
                 return (dt + timedelta(days=1)).date()
+        elif dt.hour < 8:
+            if dt.weekday() == 5:
+                return (dt + timedelta(days=2)).date()
+            elif dt.weekday() == 6:
+                return (dt + timedelta(days=1)).date()
+            else:
+                return dt.date()
         return dt.date()
 
     def set_parameters(self,
@@ -151,7 +161,8 @@ class BacktestingEngine:
                        risk_free: float = 0,
                        annual_days: int = 240,
                        half_life: int = 120,
-                       physical_symbols: list = None) -> None:
+                       physical_symbols: list = None,
+                       by_volume: bool = False) -> None:  # 🟢 增加按手配置
         """"""
         self.mode = mode
         self.vt_symbol = vt_symbol
@@ -161,6 +172,7 @@ class BacktestingEngine:
         self.size = size
         self.pricetick = pricetick
         self.start = start
+        self.by_volume = by_volume
 
         self.symbol, exchange_str = self.vt_symbol.split(".")
         self.exchange = Exchange(exchange_str)
@@ -178,13 +190,17 @@ class BacktestingEngine:
 
         self.physical_symbols = [self._normalize_vt_symbol(s) for s in physical_symbols] if physical_symbols else []
 
+        # 🟢 初始化加载 V1 默认执行模型，传入按手配置
+        self.margin_model = V1DefaultMarginModel()
+        self.slippage_model = V1DefaultSlippageModel(self.slippage)
+        self.execution_model = V1DefaultExecutionModel()
+        self.commission_model = V1DefaultCommissionModel(self.rate, self.by_volume)
+
     def add_strategy(self, strategy_class: type[CtaTemplate], setting: dict) -> None:
-        """"""
         self.strategy_class = strategy_class
         self.strategy = strategy_class(self, strategy_class.__name__, self.vt_symbol, setting)
 
     def load_data(self) -> None:
-        """"""
         if not self.physical_symbols:
             self.output(_("未输入物理合约，执行原生单合约加载模式..."))
             self.history_data.clear()
@@ -194,9 +210,9 @@ class BacktestingEngine:
                 self.history_data = load_tick_data(self.symbol, self.exchange, self.start, self.end)
             return
 
-        # 阻止未适配的 TICK + 连续换月构建
         if self.mode == BacktestingMode.TICK:
-            self.output(_("⚠️ 警告: Tick 模式结合物理换月，请确保 ContinuousBuilder 返回真实的 TickData 列表。"))
+            raise NotImplementedError(
+                _("❌ 当前 ContinuousBuilder 尚未适配 TICK 级别的物理合约拼接。请使用 BAR 模式，或去除 physical_symbols 执行纯 TICK 单合约回测。"))
 
         self.output(_("启动自动换月构建流..."))
         builder = ContinuousBuilder(self.output)
@@ -211,7 +227,6 @@ class BacktestingEngine:
         self.output(_("历史数据构建完毕，数据量：{}").format(len(self.history_data)))
 
     def run_backtesting(self) -> None:
-        """"""
         if self.mode == BacktestingMode.BAR:
             func: Callable[[Any], None] = self.new_bar
         else:
@@ -250,7 +265,6 @@ class BacktestingEngine:
         self.output(_("历史数据回放结束"))
 
     def calculate_result(self) -> DataFrame:
-        """"""
         self.output(_("开始计算逐日盯市盈亏"))
 
         if not self.trades:
@@ -260,7 +274,6 @@ class BacktestingEngine:
             if not trade.datetime:
                 continue
 
-            # 使用交易日而非自然日计算
             d: Date = self._get_trading_date(trade.datetime)
             daily_result: DailyResult = self.daily_results[d]
             daily_result.add_trade(trade)
@@ -270,7 +283,7 @@ class BacktestingEngine:
 
         for d in sorted(self.daily_results.keys()):
             daily_result = self.daily_results[d]
-            daily_result.calculate_pnl(pre_close, start_pos, self.size, self.rate, self.slippage)
+            daily_result.calculate_pnl(pre_close, start_pos, self.size, self.commission_model, self.slippage_model)
             pre_close = daily_result.close_price
             start_pos = daily_result.end_pos
 
@@ -289,7 +302,6 @@ class BacktestingEngine:
         return self.daily_df
 
     def calculate_statistics(self, df: DataFrame | None = None, output: bool = True) -> dict:
-        """"""
         self.output(_("开始计算策略统计指标"))
 
         if df is None:
@@ -481,7 +493,6 @@ class BacktestingEngine:
         return statistics
 
     def show_chart(self, df: DataFrame | None = None) -> go.Figure:
-        """"""
         if df is None:
             df = self.daily_df
         if df.empty:
@@ -560,8 +571,6 @@ class BacktestingEngine:
         return results
 
     def update_daily_close(self, price: float) -> None:
-        """"""
-        # 强制提取交易日而非自然日，修正夜盘资金跨日计算错位
         dt = self.bar.datetime if self.mode == BacktestingMode.BAR else self.tick.datetime
         trading_date = self._get_trading_date(dt)
 
@@ -573,7 +582,6 @@ class BacktestingEngine:
             self.daily_results[trading_date] = daily_result
 
     def _do_rollover(self) -> None:
-        """统一处理主力合约的动态路由切换、挂单撤除与真实摩擦计算"""
         if not self.routing_schedule:
             return
 
@@ -583,7 +591,7 @@ class BacktestingEngine:
         if not best_symbol:
             return
 
-        if best_symbol and best_symbol != self.current_physical_symbol:
+        if best_symbol != self.current_physical_symbol:
             if self.current_physical_symbol:
                 old_sym = self.current_physical_symbol
                 self.output(_("[{}] 📅 触发主力合约切换: {} -> {}").format(self.datetime, old_sym, best_symbol))
@@ -605,7 +613,6 @@ class BacktestingEngine:
                 old_pos = self.physical_positions.pop(old_sym, 0)
 
                 if old_pos != 0:
-                    ref_price = 0.0
                     old_bar = self.physical_bars.get((old_sym, check_dt))
                     new_bar = self.physical_bars.get((best_symbol, check_dt))
 
@@ -613,17 +620,44 @@ class BacktestingEngine:
                         ref_price = old_bar.close_price
                     elif new_bar:
                         ref_price = new_bar.close_price
+                    elif self.mode == BacktestingMode.TICK and getattr(self, 'tick', None):
+                        ref_price = self.tick.last_price
+                    else:
+                        ref_price = 0.0
 
                     if ref_price <= 0:
                         self.output(_("[{}] ⚠️ 换月时无有效物理价格，跳过手续费计算").format(self.datetime))
                         comm_cost = 0.0
+                        slip_cost = 0.0
                     else:
-                        comm_cost = (self.rate * ref_price * 2) * abs(old_pos) * self.size
+                        # 🟢 【精细化修正】平旧开新分离构造 mock_trade，精准支持复杂阶梯费率模型
+                        mock_trade_close = TradeData(symbol=old_sym.split(".")[0],
+                                                     exchange=self.exchange,
+                                                     orderid="ROLLOVER_CLOSE",
+                                                     tradeid="ROLLOVER_CLOSE",
+                                                     direction=Direction.LONG if old_pos < 0 else Direction.SHORT,
+                                                     offset=Offset.CLOSE,
+                                                     price=ref_price,
+                                                     volume=abs(old_pos),
+                                                     datetime=self.datetime,
+                                                     gateway_name=self.gateway_name)
+                        mock_trade_open = TradeData(symbol=best_symbol.split(".")[0],
+                                                    exchange=self.exchange,
+                                                    orderid="ROLLOVER_OPEN",
+                                                    tradeid="ROLLOVER_OPEN",
+                                                    direction=Direction.LONG if old_pos > 0 else Direction.SHORT,
+                                                    offset=Offset.OPEN,
+                                                    price=ref_price,
+                                                    volume=abs(old_pos),
+                                                    datetime=self.datetime,
+                                                    gateway_name=self.gateway_name)
+                        comm_cost = self.commission_model.get_commission(mock_trade_close, self.size) + \
+                                    self.commission_model.get_commission(mock_trade_open, self.size)
+                        slip_cost = self.slippage_model.get_slippage(mock_trade_close, self.size) + \
+                                    self.slippage_model.get_slippage(mock_trade_open, self.size)
 
-                    slip_cost = self.slippage * 2 * abs(old_pos) * self.size
                     rollover_pnl = -slip_cost - comm_cost
 
-                    # 使用 _get_trading_date 对齐换月损耗与策略盈亏记账日
                     dt = self.bar.datetime if self.mode == BacktestingMode.BAR else self.tick.datetime
                     d = self._get_trading_date(dt)
 
@@ -636,14 +670,17 @@ class BacktestingEngine:
 
                     daily_result.rollover_pnl += rollover_pnl
 
-                    # 强行平旧开新，防止锁仓数据异常
-                    self.physical_positions[best_symbol] = old_pos
+                    existing_pos = self.physical_positions.get(best_symbol, 0)
+                    if existing_pos != 0:
+                        self.output(
+                            _("[{}] ⚠️ 警告: 换月时新主力 {} 已存在非零持仓 {}，执行累加合并").format(self.datetime, best_symbol, existing_pos))
+                    self.physical_positions[best_symbol] = existing_pos + old_pos
+
                     self.output(_("[{}] 💰 执行换月仓位平移，产生纯摩擦损耗(滑点+手续费): {:.2f}").format(self.datetime, rollover_pnl))
 
             self.current_physical_symbol = best_symbol
 
     def new_bar(self, bar: BarData) -> None:
-        """"""
         self.bar = bar
         self.datetime = bar.datetime
 
@@ -654,7 +691,6 @@ class BacktestingEngine:
         self.update_daily_close(bar.close_price)
 
     def new_tick(self, tick: TickData) -> None:
-        """"""
         self.tick = tick
         self.datetime = tick.datetime
 
@@ -667,56 +703,41 @@ class BacktestingEngine:
     def cross_limit_order(self) -> None:
         if self.mode == BacktestingMode.BAR:
             if self.current_physical_symbol:
-                current_bar = self.physical_bars.get((self.current_physical_symbol, self.datetime))
-                if not current_bar:
+                lookup_dt = self.datetime.replace(microsecond=0)
+                current_data = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
+                if not current_data:
                     return
             else:
-                current_bar = self.bar
-
-            long_cross_price = current_bar.low_price
-            short_cross_price = current_bar.high_price
-            long_best_price = current_bar.open_price
-            short_best_price = current_bar.open_price
+                current_data = self.bar
         else:
-            long_cross_price = self.tick.ask_price_1
-            short_cross_price = self.tick.bid_price_1
-            long_best_price = long_cross_price
-            short_best_price = short_cross_price
+            current_data = self.tick
 
         for order in list(self.active_limit_orders.values()):
             if order.status == Status.SUBMITTING:
                 order.status = Status.NOTTRADED
                 self.strategy.on_order(order)
 
-            long_cross: bool = (order.direction == Direction.LONG and order.price >= long_cross_price and long_cross_price > 0)
-            short_cross: bool = (order.direction == Direction.SHORT and order.price <= short_cross_price
-                                 and short_cross_price > 0)
+            trade_price, trade_volume = self.execution_model.match_limit_order(order, current_data)
 
-            if not long_cross and not short_cross:
+            if trade_volume == 0:
                 continue
 
-            order.traded = order.volume
-            order.status = Status.ALLTRADED
-            self.strategy.on_order(order)
+            # 🟢 【防错保险】确保执行模型返回的成交量不会超过剩余可成交量
+            trade_volume = min(trade_volume, order.volume - order.traded)
 
-            if order.vt_orderid in self.active_limit_orders:
+            order.traded += trade_volume
+            if order.traded == order.volume:
+                order.status = Status.ALLTRADED
                 self.active_limit_orders.pop(order.vt_orderid)
+            else:
+                order.status = Status.PARTTRADED
 
+            self.strategy.on_order(order)
             self.trade_count += 1
 
             vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
-
-            if order.direction == Direction.LONG:
-                self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + order.volume
-            else:
-                self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) - order.volume
-
-            if long_cross:
-                trade_price = min(order.price, long_best_price)
-                pos_change = order.volume
-            else:
-                trade_price = max(order.price, short_best_price)
-                pos_change = -order.volume
+            pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
+            self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
 
             trade: TradeData = TradeData(
                 symbol=order.symbol,
@@ -726,7 +747,7 @@ class BacktestingEngine:
                 direction=order.direction,
                 offset=order.offset,
                 price=trade_price,
-                volume=order.volume,
+                volume=trade_volume,
                 datetime=self.datetime,
                 gateway_name=self.gateway_name,
             )
@@ -738,28 +759,23 @@ class BacktestingEngine:
     def cross_stop_order(self) -> None:
         if self.mode == BacktestingMode.BAR:
             if self.current_physical_symbol:
-                current_bar = self.physical_bars.get((self.current_physical_symbol, self.datetime))
-                if not current_bar:
+                lookup_dt = self.datetime.replace(microsecond=0)
+                current_data = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
+                if not current_data:
                     return
             else:
-                current_bar = self.bar
-
-            long_cross_price = current_bar.high_price
-            short_cross_price = current_bar.low_price
-            long_best_price = current_bar.open_price
-            short_best_price = current_bar.open_price
+                current_data = self.bar
         else:
-            long_cross_price = self.tick.last_price
-            short_cross_price = self.tick.last_price
-            long_best_price = long_cross_price
-            short_best_price = short_cross_price
+            current_data = self.tick
 
         for stop_order in list(self.active_stop_orders.values()):
-            long_cross: bool = (stop_order.direction == Direction.LONG and stop_order.price <= long_cross_price)
-            short_cross: bool = (stop_order.direction == Direction.SHORT and stop_order.price >= short_cross_price)
+            trade_price, trade_volume = self.execution_model.match_stop_order(stop_order, current_data)
 
-            if not long_cross and not short_cross:
+            if trade_volume == 0:
                 continue
+
+            # 🟢 【防错保险】限制最高触发量
+            trade_volume = min(trade_volume, stop_order.volume)
 
             self.limit_order_count += 1
 
@@ -772,29 +788,27 @@ class BacktestingEngine:
                                          direction=stop_order.direction,
                                          offset=stop_order.offset,
                                          price=stop_order.price,
-                                         volume=stop_order.volume,
-                                         traded=stop_order.volume,
+                                         volume=trade_volume,
+                                         traded=trade_volume,
                                          status=Status.ALLTRADED,
                                          gateway_name=self.gateway_name,
                                          datetime=self.datetime)
 
+            # 🟢 【资金约束】止损单（尤指突破开仓单）被触发转化为限价单的瞬间，执行资金校验
+            if not self.margin_model.check_margin(order, self):
+                self.output(_("[{}] ⚠️ 止损单触发被拒：资金/保证金不足 - {}").format(self.datetime, order.vt_symbol))
+                stop_order.status = StopOrderStatus.CANCELLED
+                self.strategy.on_stop_order(stop_order)
+                if stop_order.stop_orderid in self.active_stop_orders:
+                    self.active_stop_orders.pop(stop_order.stop_orderid)
+                continue
+
             self.limit_orders[order.vt_orderid] = order
-
-            if long_cross:
-                trade_price = max(stop_order.price, long_best_price)
-                pos_change = order.volume
-            else:
-                trade_price = min(stop_order.price, short_best_price)
-                pos_change = -order.volume
-
             self.trade_count += 1
 
             vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
-
-            if order.direction == Direction.LONG:
-                self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + order.volume
-            else:
-                self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) - order.volume
+            pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
+            self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
 
             trade: TradeData = TradeData(
                 symbol=order.symbol,
@@ -804,7 +818,7 @@ class BacktestingEngine:
                 direction=order.direction,
                 offset=order.offset,
                 price=trade_price,
-                volume=order.volume,
+                volume=trade_volume,
                 datetime=self.datetime,
                 gateway_name=self.gateway_name,
             )
@@ -839,9 +853,13 @@ class BacktestingEngine:
                    lock: bool, net: bool) -> list:
         price = round_to(price, self.pricetick)
         if stop:
-            vt_orderid: str = self.send_stop_order(direction, offset, price, volume)
+            vt_orderid = self.send_stop_order(direction, offset, price, volume)
         else:
             vt_orderid = self.send_limit_order(direction, offset, price, volume)
+
+        # 🟢 【修复1】被拦截时抛出空列表，避免返回脏数据 [""]
+        if not vt_orderid:
+            return []
         return [vt_orderid]
 
     def send_stop_order(self, direction: Direction, offset: Offset, price: float, volume: float) -> str:
@@ -879,6 +897,12 @@ class BacktestingEngine:
                                      status=Status.SUBMITTING,
                                      gateway_name=self.gateway_name,
                                      datetime=self.datetime)
+
+        if not self.margin_model.check_margin(order, self):
+            self.output(_("[{}] ⚠️ 订单被拒：资金/保证金不足 - {}").format(self.datetime, order.vt_symbol))
+            order.status = Status.REJECTED
+            return ""
+
         self.active_limit_orders[order.vt_orderid] = order
         self.limit_orders[order.vt_orderid] = order
         return order.vt_orderid
@@ -951,7 +975,6 @@ class DailyResult:
     """"""
 
     def __init__(self, date: Date, close_price: float) -> None:
-        """"""
         self.date: Date = date
         self.close_price: float = close_price
         self.pre_close: float = 0
@@ -973,11 +996,10 @@ class DailyResult:
         self.net_pnl: float = 0
 
     def add_trade(self, trade: TradeData) -> None:
-        """"""
         self.trades.append(trade)
 
-    def calculate_pnl(self, pre_close: float, start_pos: float, size: float, rate: float, slippage: float) -> None:
-        """"""
+    def calculate_pnl(self, pre_close: float, start_pos: float, size: float, commission_model: BaseCommissionModel,
+                      slippage_model: BaseSlippageModel) -> None:
         if pre_close:
             self.pre_close = pre_close
         else:
@@ -999,10 +1021,10 @@ class DailyResult:
 
             turnover: float = trade.volume * size * trade.price
             self.trading_pnl += pos_change * (self.close_price - trade.price) * size
-            self.slippage += trade.volume * size * slippage
 
+            self.slippage += slippage_model.get_slippage(trade, size)
+            self.commission += commission_model.get_commission(trade, size)
             self.turnover += turnover
-            self.commission += turnover * rate
 
         self.total_pnl = self.trading_pnl + self.holding_pnl
         self.net_pnl = self.total_pnl - self.commission - self.slippage + self.rollover_pnl
@@ -1022,7 +1044,7 @@ def load_tick_data(symbol: str, exchange: Exchange, start: datetime, end: dateti
 
 def evaluate(target_name: str, strategy_class: type[CtaTemplate], vt_symbol: str, interval: Interval, start: datetime,
              rate: float, slippage: float, size: float, pricetick: float, capital: int, end: datetime, mode: BacktestingMode,
-             annual_days: int, half_life: int, physical_symbols: list, setting: dict) -> tuple:
+             annual_days: int, half_life: int, physical_symbols: list, by_volume: bool, setting: dict) -> tuple:
     engine: BacktestingEngine = BacktestingEngine()
     engine.set_parameters(vt_symbol=vt_symbol,
                           interval=interval,
@@ -1036,7 +1058,8 @@ def evaluate(target_name: str, strategy_class: type[CtaTemplate], vt_symbol: str
                           mode=mode,
                           annual_days=annual_days,
                           half_life=half_life,
-                          physical_symbols=physical_symbols)
+                          physical_symbols=physical_symbols,
+                          by_volume=by_volume)
     engine.add_strategy(strategy_class, setting)
     engine.load_data()
     engine.run_backtesting()
@@ -1049,7 +1072,8 @@ def evaluate(target_name: str, strategy_class: type[CtaTemplate], vt_symbol: str
 def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
     func: Callable = partial(evaluate, target_name, engine.strategy_class, engine.vt_symbol, engine.interval, engine.start,
                              engine.rate, engine.slippage, engine.size, engine.pricetick, engine.capital, engine.end,
-                             engine.mode, engine.annual_days, engine.half_life, getattr(engine, 'physical_symbols', []))
+                             engine.mode, engine.annual_days, engine.half_life, getattr(engine, 'physical_symbols', []),
+                             getattr(engine, 'by_volume', False))
     return func
 
 
