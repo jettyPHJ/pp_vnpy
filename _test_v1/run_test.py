@@ -121,97 +121,104 @@ def generate_web_report(engine, df, stats):
     """
 
     # ==========================================================
-    # 3. 换月 QA 审计表（T±1 上下文，高亮换月行）
-    #    - 修复：两处 strftime 调用都走 pd.to_datetime() 强转，防 Index 类型报错
+    # 3. 换月明细审计 (直接读取底层的 rollover_logs 账本)
     # ==========================================================
-    qa_html = "<div class='alert-danger-box'>❌ 缺失 rollover_pnl 列，V1 扩展未生效！</div>"
+    rollover_logs = engine.get_rollover_logs()
 
-    if df is not None and not df.empty and "rollover_pnl" in df.columns:
-        rollover_days = df[df["rollover_pnl"] < 0]
+    if not rollover_logs:
+        qa_html = "<div class='alert-ok-box'>✅ 本次回测未检测到换月摩擦扣费。</div>"
+    else:
+        headers = "<th>换月时间</th><th>平旧合约</th><th>开新合约</th><th>方向</th><th>手数</th><th>结算基准价</th><th>双边手续费</th><th>双边滑点</th><th>摩擦总损耗</th>"
+        rows = []
+        for log in rollover_logs:
+            dt_str = log['datetime'].strftime('%Y-%m-%d %H:%M')
+            rows.append(f"<tr class='rollover-row'>"
+                        f"<td>{dt_str}</td>"
+                        f"<td class='mono' style='color:var(--red);'>{log['old_symbol']}</td>"
+                        f"<td class='mono' style='color:var(--green);'>{log['new_symbol']}</td>"
+                        f"<td>{log['direction']}</td>"
+                        f"<td>{log['volume']}</td>"
+                        f"<td class='mono'>{log['ref_price']:.2f}</td>"
+                        f"<td class='mono'>{log['commission']:.2f}</td>"
+                        f"<td class='mono'>{log['slippage']:.2f}</td>"
+                        f"<td class='stat-val' style='color:var(--gold);'>{log['rollover_pnl']:.2f}</td>"
+                        f"</tr>")
 
-        if rollover_days.empty:
-            qa_html = "<div class='alert-ok-box'>✅ 本次回测未检测到换月摩擦扣费。</div>"
-        else:
-            # 构建 T±1 上下文索引
-            idx_positions = [df.index.get_loc(d) for d in rollover_days.index]
-            context_idx = set()
-            for i in idx_positions:
-                if i > 0: context_idx.add(i - 1)
-                context_idx.add(i)
-                if i < len(df) - 1: context_idx.add(i + 1)
-
-            qa_df = df.iloc[sorted(context_idx)].copy()
-            display_cols = [c for c in ["close_price", "end_pos", "rollover_pnl", "net_pnl"] if c in qa_df.columns]
-            qa_df = qa_df[display_cols]
-
-            # ✅ 修复：用 pd.to_datetime() 强转，彻底规避 Index 无 strftime 问题
-            rollover_dates_str = set(pd.to_datetime(rollover_days.index).strftime("%Y-%m-%d"))
-            qa_index_str = pd.to_datetime(qa_df.index).strftime("%Y-%m-%d")
-
-            col_labels = {"close_price": "收盘价", "end_pos": "持仓", "rollover_pnl": "换月损耗", "net_pnl": "日净盈亏"}
-            headers = "<th>日期</th>" + "".join(f"<th>{col_labels.get(c, c)}</th>" for c in display_cols)
-
-            rows = []
-            for date_str, (_, row) in zip(qa_index_str, qa_df.iterrows()):
-                is_rollover = date_str in rollover_dates_str
-                row_class = " class='rollover-row'" if is_rollover else ""
-                cells = f"<td>{date_str}</td>" + "".join(
-                    f"<td>{row[c]:.2f}</td>" if isinstance(row[c], float) else f"<td>{row[c]}</td>" for c in display_cols)
-                rows.append(f"<tr{row_class}>{cells}</tr>")
-
-            qa_html = f"""
-            <p class="hint-text">🟡 高亮行为换月日 &nbsp;|&nbsp; |换月损耗| ≈ 持仓手数 × 2 × (单边手续费 + 单边滑点)</p>
-            <div class="scroll-box">
-                <table class="data-table w-100">
-                    <thead><tr>{headers}</tr></thead>
-                    <tbody>{''.join(rows)}</tbody>
-                </table>
-            </div>
-            """
+        qa_html = f"""
+        <p class="hint-text">🟡 数据来源：引擎底层换月事件账本 (Rollover Logs)</p>
+        <div class="scroll-box">
+            <table class="data-table w-100">
+                <thead><tr>{headers}</tr></thead>
+                <tbody>{''.join(rows)}</tbody>
+            </table>
+        </div>
+        """
 
     # ==========================================================
     # 4. 订单生命周期
     # ==========================================================
-    orders = engine.get_all_orders()
-    if orders:
+    def normalize_dt(dt):
+        if dt is None: return pd.Timestamp.min
+        ts = pd.Timestamp(dt)
+        if ts.tzinfo is not None: ts = ts.tz_convert(None)
+        return ts
+
+    all_orders = []
+    for o in engine.get_all_orders():
+        sym = getattr(o, "vt_symbol", o.symbol)  # 统一使用完整 vt_symbol
+        all_orders.append({
+            "dt": o.datetime,
+            "sym": sym,
+            "type": "Limit",
+            "dir": o.direction.value,
+            "off": o.offset.value,
+            "price": o.price,
+            "vol": o.volume,
+            "status": str(o.status.value),
+            "reason": ""
+        })
+
+    for so in engine.get_all_stop_orders():
+        reason = getattr(so, "cancel_reason", "")
+        all_orders.append({
+            "dt": so.datetime,
+            "sym": so.vt_symbol,
+            "type": "Stop",
+            "dir": so.direction.value,
+            "off": so.offset.value,
+            "price": so.price,
+            "vol": so.volume,
+            "status": str(so.status.value),
+            "reason": reason
+        })
+
+    all_orders.sort(key=lambda x: normalize_dt(x["dt"]))
+
+    if all_orders:
         order_rows = []
-        for o in orders:
-            status_str = str(o.status.value)
-            is_cancelled = "撤销" in status_str or "CANCEL" in status_str.upper()
+        for o in all_orders:
+            is_cancelled = "撤销" in o["status"] or "CANCEL" in o["status"].upper()
             row_class = " class='cancel-row'" if is_cancelled else ""
-            order_rows.append(f"<tr{row_class}>"
-                              f"<td>{pd.to_datetime(o.datetime).strftime('%Y-%m-%d %H:%M')}</td>"
-                              f"<td class='mono'>{o.symbol}</td>"
-                              f"<td>{o.direction.value}</td>"
-                              f"<td>{o.offset.value}</td>"
-                              f"<td class='mono'>{o.price:.2f}</td>"
-                              f"<td>{o.volume}</td>"
-                              f"<td>{status_str}</td>"
-                              f"</tr>")
-        orders_html = f"""
-        <div class="scroll-box">
-            <table class="data-table w-100">
-                <thead><tr>
-                    <th>发单时间</th><th>合约</th><th>方向</th>
-                    <th>动作</th><th>价格</th><th>数量</th><th>状态</th>
-                </tr></thead>
-                <tbody>{''.join(order_rows)}</tbody>
-            </table>
-        </div>
-        """
+            reason_badge = f" <span style='font-size:0.7rem;color:#856404;background:#fff3cd;padding:2px 4px;border-radius:3px;'>{o['reason']}</span>" if o[
+                'reason'] else ""
+            order_rows.append(
+                f"<tr{row_class}><td>{normalize_dt(o['dt']).strftime('%Y-%m-%d %H:%M')}</td><td class='mono'>{o['sym']}</td><td>{o['type']}</td><td>{o['dir']}</td><td>{o['off']}</td><td class='mono'>{o['price']:.2f}</td><td>{o['vol']}</td><td>{o['status']}{reason_badge}</td></tr>"
+            )
+        orders_html = f"""<div class="scroll-box"><table class="data-table w-100"><thead><tr><th>发单时间</th><th>合约</th><th>类型</th><th>方向</th><th>动作</th><th>价格</th><th>数量</th><th>状态</th></tr></thead><tbody>{''.join(order_rows)}</tbody></table></div>"""
     else:
         orders_html = "<div class='empty-state'>无委托记录</div>"
 
     # ==========================================================
-    # 5. 成交记录
+    # 5. 成交记录 (统一显示完整 vt_symbol)
     # ==========================================================
     trades = engine.get_all_trades()
     if trades:
         trade_rows = []
         for t in trades:
+            sym = getattr(t, "vt_symbol", f"{t.symbol}.{t.exchange.value}")  # 👈 统一完整符号
             trade_rows.append(f"<tr>"
                               f"<td>{pd.to_datetime(t.datetime).strftime('%Y-%m-%d %H:%M')}</td>"
-                              f"<td class='mono'>{t.symbol}</td>"
+                              f"<td class='mono'>{sym}</td>"
                               f"<td>{t.direction.value}</td>"
                               f"<td>{t.offset.value}</td>"
                               f"<td class='mono'>{t.price:.2f}</td>"
@@ -437,7 +444,7 @@ def generate_web_report(engine, df, stats):
         <!-- 右列：换月审计 + 绩效指标 -->
         <div>
             <div class="card">
-                <div class="card-header">换月 QA 审计 · T±1 上下文</div>
+                <div class="card-header">引擎级换月事件审计 (Rollover Logs)</div>
                 <div class="card-body">
                     {qa_html}
                 </div>
@@ -446,6 +453,9 @@ def generate_web_report(engine, df, stats):
             <div class="card">
                 <div class="card-header">绩效指标</div>
                 <div class="card-body">
+                    <p class="hint-text" style="color: #f59e0b; font-weight: 500; text-align: center; border-bottom: 1px solid var(--border); padding-bottom: 10px;">
+                        ⚠️ 已知局限：若策略加载未拼接的虚拟历史，前 N 根 K 线将作为暖机期无交易信号。
+                    </p>
                     <div class="scroll-box" style="max-height:340px">
                         {stats_html}
                     </div>

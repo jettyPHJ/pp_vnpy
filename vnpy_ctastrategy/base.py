@@ -5,6 +5,7 @@ Defines constants and objects used in CtaStrategy App.
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timedelta
+from typing import Optional
 
 from vnpy.trader.constant import Direction, Offset, Interval
 from .locale import _
@@ -43,12 +44,14 @@ class StopOrder:
     net: bool = False
     vt_orderids: list = field(default_factory=list)
     status: StopOrderStatus = StopOrderStatus.WAITING
+    # 👇 V1.1 新增：撤单原因与时间，使用 Any 绕过 Pylance 报错
+    cancel_reason: str = ""
+    cancel_datetime: Optional[datetime] = None  # type: ignore
 
 
 EVENT_CTA_LOG = "eCtaLog"
 EVENT_CTA_STRATEGY = "eCtaStrategy"
 EVENT_CTA_STOPORDER = "eCtaStopOrder"
-
 
 INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
     Interval.TICK: timedelta(milliseconds=1),

@@ -93,6 +93,9 @@ class BacktestingEngine:
         self.execution_model: BaseExecutionModel = None
         self.commission_model: BaseCommissionModel = None
 
+        self.stop_order_history: dict[str, StopOrder] = {}
+        self.rollover_logs: list[dict] = []
+
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
         self.stop_order_count = 0
@@ -114,6 +117,9 @@ class BacktestingEngine:
         self.routing_schedule.clear()
         self.physical_bars.clear()
         self._symbol_cache.clear()
+
+        self.stop_order_history.clear()
+        self.rollover_logs.clear()
 
     def _normalize_vt_symbol(self, symbol: str) -> str:
         if not symbol:
@@ -603,12 +609,13 @@ class BacktestingEngine:
                 for vt_orderid in to_cancel_limit:
                     self.cancel_limit_order(self.strategy, vt_orderid)
 
+                # 1. 强制撤销旧合约的停止单（规范化对比）
                 to_cancel_stop = [
                     soid for soid, stop_order in self.active_stop_orders.items()
-                    if self._normalize_vt_symbol(stop_order.vt_symbol) == old_sym
+                    if self._normalize_vt_symbol(stop_order.vt_symbol) == self._normalize_vt_symbol(old_sym)
                 ]
                 for soid in to_cancel_stop:
-                    self.cancel_stop_order(self.strategy, soid)
+                    self.cancel_stop_order(self.strategy, soid, reason="主力换月强制撤单")
 
                 old_pos = self.physical_positions.pop(old_sym, 0)
 
@@ -657,6 +664,21 @@ class BacktestingEngine:
                                     self.slippage_model.get_slippage(mock_trade_open, self.size)
 
                     rollover_pnl = -slip_cost - comm_cost
+
+                    self.rollover_logs.append({
+                        "datetime": self.datetime,
+                        "old_symbol": old_sym,
+                        "new_symbol": best_symbol,
+                        "position": old_pos,
+                        "volume": abs(old_pos),
+                        "direction": "Long" if old_pos > 0 else "Short",
+                        "ref_price": ref_price,
+                        "commission": comm_cost,
+                        "slippage": slip_cost,
+                        "rollover_pnl": rollover_pnl,
+                        "reason": "main_contract_rollover",
+                        "note": "仅计摩擦成本，新旧价差由底座复权拼接自然消化"
+                    })
 
                     dt = self.bar.datetime if self.mode == BacktestingMode.BAR else self.tick.datetime
                     d = self._get_trading_date(dt)
@@ -879,6 +901,7 @@ class BacktestingEngine:
         )
         self.active_stop_orders[stop_order.stop_orderid] = stop_order
         self.stop_orders[stop_order.stop_orderid] = stop_order
+        self.stop_order_history[stop_order.stop_orderid] = stop_order
         return stop_order.stop_orderid
 
     def send_limit_order(self, direction: Direction, offset: Offset, price: float, volume: float) -> str:
@@ -913,12 +936,18 @@ class BacktestingEngine:
         else:
             self.cancel_limit_order(strategy, vt_orderid)
 
-    def cancel_stop_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
+    def cancel_stop_order(self, strategy: CtaTemplate, vt_orderid: str, reason: str = "") -> None:
         if vt_orderid not in self.active_stop_orders:
             return
+
         stop_order: StopOrder = self.active_stop_orders.pop(vt_orderid)
         stop_order.status = StopOrderStatus.CANCELLED
-        self.strategy.on_stop_order(stop_order)
+
+        if reason:
+            stop_order.cancel_reason = reason
+        stop_order.cancel_datetime = self.datetime
+
+        strategy.on_stop_order(stop_order)
 
     def cancel_limit_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
         if vt_orderid not in self.active_limit_orders:
@@ -969,6 +998,12 @@ class BacktestingEngine:
 
     def get_all_daily_results(self) -> list:
         return list(self.daily_results.values())
+
+    def get_rollover_logs(self) -> list:
+        return list(self.rollover_logs)
+
+    def get_all_stop_orders(self) -> list:
+        return list(self.stop_order_history.values())
 
 
 class DailyResult:
