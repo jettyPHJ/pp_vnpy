@@ -361,7 +361,8 @@ class BacktesterManager(QtWidgets.QWidget):
             pricetick,
             capital,
             new_setting,
-            physical_symbols  # <--- 新增
+            physical_symbols,
+            warmup_days=120  # V1.2 暂时硬编码，V1.3 改为从控件读取
         )
 
         if result:

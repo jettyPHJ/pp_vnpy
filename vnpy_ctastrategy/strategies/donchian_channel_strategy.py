@@ -1,3 +1,4 @@
+from vnpy.trader.constant import Interval
 from vnpy.trader.utility import ArrayManager
 from vnpy.trader.object import TickData, BarData, TradeData
 from vnpy_ctastrategy import CtaTemplate
@@ -40,7 +41,7 @@ class DonchianChannelStrategy(CtaTemplate):
         buffer_size = max(self.entry_window, self.exit_window) + 50
         self.am = ArrayManager(buffer_size)
 
-        self.load_bar(buffer_size)
+        self.load_bar(buffer_size, interval=Interval.DAILY)
         self.write_log(f"策略初始化完成，历史数据缓存容量 = {buffer_size}")
 
     def on_start(self):

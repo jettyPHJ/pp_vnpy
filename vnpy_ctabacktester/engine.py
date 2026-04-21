@@ -129,21 +129,20 @@ class BacktesterEngine(BaseEngine):
         """"""
         return list(self.classes.keys())
 
-    def run_backtesting(
-            self,
-            class_name: str,
-            vt_symbol: str,
-            interval: str,
-            start: datetime,
-            end: datetime,
-            rate: float,
-            slippage: float,
-            size: int,
-            pricetick: float,
-            capital: int,
-            setting: dict,
-            physical_symbols: list = None  # <--- 新增
-    ) -> None:
+    def run_backtesting(self,
+                        class_name: str,
+                        vt_symbol: str,
+                        interval: str,
+                        start: datetime,
+                        end: datetime,
+                        rate: float,
+                        slippage: float,
+                        size: int,
+                        pricetick: float,
+                        capital: int,
+                        setting: dict,
+                        physical_symbols: list = None,
+                        warmup_days: int = 120) -> None:
         """"""
         self.result_df = None
         self.result_statistics = None
@@ -156,19 +155,18 @@ class BacktesterEngine(BaseEngine):
         else:
             mode = BacktestingMode.BAR
 
-        engine.set_parameters(
-            vt_symbol=vt_symbol,
-            interval=interval,
-            start=start,
-            end=end,
-            rate=rate,
-            slippage=slippage,
-            size=size,
-            pricetick=pricetick,
-            capital=capital,
-            mode=mode,
-            physical_symbols=physical_symbols  # # <--- 新增
-        )
+        engine.set_parameters(vt_symbol=vt_symbol,
+                              interval=interval,
+                              start=start,
+                              end=end,
+                              rate=rate,
+                              slippage=slippage,
+                              size=size,
+                              pricetick=pricetick,
+                              capital=capital,
+                              mode=mode,
+                              physical_symbols=physical_symbols,
+                              warmup_days=warmup_days)
 
         strategy_class: type[CtaTemplate] = self.classes[class_name]
         engine.add_strategy(strategy_class, setting)
@@ -198,42 +196,28 @@ class BacktesterEngine(BaseEngine):
         event: Event = Event(EVENT_BACKTESTER_BACKTESTING_FINISHED)
         self.event_engine.put(event)
 
-    def start_backtesting(
-            self,
-            class_name: str,
-            vt_symbol: str,
-            interval: str,
-            start: datetime,
-            end: datetime,
-            rate: float,
-            slippage: float,
-            size: float,
-            pricetick: float,
-            capital: float,
-            setting: dict,
-            physical_symbols: list = None  # <--- 新增
-    ) -> bool:
+    def start_backtesting(self,
+                          class_name: str,
+                          vt_symbol: str,
+                          interval: str,
+                          start: datetime,
+                          end: datetime,
+                          rate: float,
+                          slippage: float,
+                          size: float,
+                          pricetick: float,
+                          capital: float,
+                          setting: dict,
+                          physical_symbols: list = None,
+                          warmup_days: int = 120) -> bool:
         if self.thread:
             self.write_log(_("已有任务在运行中，请等待完成"))
             return False
 
         self.write_log("-" * 40)
-        self.thread = Thread(
-            target=self.run_backtesting,
-            args=(
-                class_name,
-                vt_symbol,
-                interval,
-                start,
-                end,
-                rate,
-                slippage,
-                size,
-                pricetick,
-                capital,
-                setting,
-                physical_symbols  # <--- 新增
-            ))
+        self.thread = Thread(target=self.run_backtesting,
+                             args=(class_name, vt_symbol, interval, start, end, rate, slippage, size, pricetick, capital,
+                                   setting, physical_symbols, warmup_days))
         self.thread.start()
 
         return True
@@ -465,3 +449,17 @@ class BacktesterEngine(BaseEngine):
 
     def get_all_stop_orders(self) -> list:
         return self.backtesting_engine.get_all_stop_orders()
+
+    def get_rollover_skip_logs(self) -> list:
+        return getattr(self.backtesting_engine, 'rollover_skip_logs', [])
+
+    def get_data_quality(self) -> dict:
+        """返回数据加载质量摘要，供报告层消费"""
+        engine = self.backtesting_engine
+        return {
+            "data_load_failed": getattr(engine, 'data_load_failed', False),
+            "data_load_error": getattr(engine, 'data_load_error', ''),
+            "warmup_blocked_orders": getattr(engine, 'warmup_blocked_orders', []),
+            "warmup_interval_mismatch_logs": getattr(engine, 'warmup_interval_mismatch_logs', []),
+            "order_audit_logs": getattr(engine, 'order_audit_logs', {}),
+        }
