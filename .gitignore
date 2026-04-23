@@ -8,4 +8,4 @@
 *.so
 
 # 忽略所有以 _test 开头的测试文件夹及其内部所有内容
-_test_v1/v1_result/
+_test_v1/result/

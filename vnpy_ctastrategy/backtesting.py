@@ -24,7 +24,7 @@ from .template import CtaTemplate
 from .locale import _
 from .continuous_builder import ContinuousBuilder
 
-# 🟢 导入可热插拔的模块接口与 V1 默认实现
+# 导入可热插拔的模块接口与 V1 默认实现
 from .backtesting_modules import (BaseMarginModel, BaseSlippageModel, BaseExecutionModel, BaseCommissionModel,
                                   V1DefaultMarginModel, V1DefaultSlippageModel, V1DefaultExecutionModel,
                                   V1DefaultCommissionModel)
@@ -234,6 +234,37 @@ class BacktestingEngine:
         trade_for_strategy = copy(trade)
         trade_for_strategy.price = getattr(trade, "accounting_price", trade.price)
         self.strategy.on_trade(trade_for_strategy)
+
+    # ====== 检查验证 ======
+    def _audit_financial_consistency(self) -> bool:
+        """
+        [内置财务审计] 执行双轨制坐标系一致性断言
+        确保复权连续K线算出的盈亏，与物理真实合约交收的盈亏完全一致
+        """
+        self.output("🔎 正在核对底层结算数据（复权盈亏 vs 真实盈亏）...")
+
+        # 1. 理论会计总盈亏 (基于复权价计算)
+        theoretical_pnl = sum([result.trading_pnl + result.holding_pnl for result in self.daily_results.values()])
+
+        # 2. 换月摩擦损耗 (从换月日志中提取)
+        rollover_friction = sum([log.get("rollover_pnl", 0) for log in self.rollover_logs])
+
+        # 3. 物理账本真实净盈亏, 扣除了手续费、滑点，并叠加了物理换月真实资金变化
+        total_commission = sum([result.commission for result in self.daily_results.values()])
+        total_slippage = sum([result.slippage for result in self.daily_results.values()])
+        real_net_pnl = theoretical_pnl - total_commission - total_slippage + rollover_friction
+
+        # 核心断言逻辑 (容忍极小的浮点数误差)
+        tolerance = 1e-4
+        is_consistent = abs((theoretical_pnl + rollover_friction - total_commission - total_slippage) -
+                            real_net_pnl) < tolerance
+
+        if is_consistent:
+            self.output("✅ 对账成功！盈亏数据真实有效。")
+            return True
+        else:
+            self.output("❌ 严重警告：财务对账失败！存在盈亏泄露或幽灵利润，请立刻检查复权映射逻辑！")
+            return False
 
     def set_parameters(self,
                        vt_symbol: str,
@@ -573,6 +604,9 @@ class BacktestingEngine:
             self.output(f"EWM Sharpe：\t{ewm_sharpe:,.2f}")
             self.output(_("收益回撤比：\t{:,.2f}").format(return_drawdown_ratio))
             self.output(f"RGR Ratio：\t{rgr_ratio:,.2f}")
+
+        # 统计完成后，自动执行底层的强制对账
+        self._audit_financial_consistency()
 
         statistics: dict = {
             "start_date": start_date,
