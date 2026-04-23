@@ -108,6 +108,8 @@ class BacktestingEngine:
         self.limit_order_history: dict[str, OrderData] = {}
         self.data_load_failed: bool = False
         self.data_load_error: str = ""
+        self.backtest_failed: bool = False
+        self.backtest_error: str = ""
 
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
@@ -138,11 +140,12 @@ class BacktestingEngine:
         self.warmup_blocked_orders.clear()
         self.warmup_interval_mismatch_logs.clear()
         self.bar_route_map.clear()
-        self.physical_bars.clear()
         self.order_audit_logs.clear()
         self.limit_order_history.clear()
         self.data_load_failed = False
         self.data_load_error = ""
+        self.backtest_failed = False
+        self.backtest_error = ""
 
     def _normalize_datetime(self, dt) -> datetime:
         """
@@ -239,32 +242,30 @@ class BacktestingEngine:
     # ====== 检查验证 ======
     def _audit_financial_consistency(self) -> bool:
         """
-        [内置财务审计] 执行双轨制坐标系一致性断言
-        确保复权连续K线算出的盈亏，与物理真实合约交收的盈亏完全一致
+        [内置财务审计] 执行双账本交叉核验 (Daily 账本 vs Rollover 独立日志)
         """
-        self.output("🔎 正在核对底层结算数据（复权盈亏 vs 真实盈亏）...")
+        self.output("🔎 正在执行交叉财务核验（Daily账本净值 vs 独立摩擦日志）...")
 
-        # 1. 理论会计总盈亏 (基于复权价计算)
+        # 1. 实际总净收益 (汇总 daily_results 中已经扣除过 rollover_pnl 的结果)
+        actual_net_pnl = sum([result.net_pnl for result in self.daily_results.values()])
+
+        # 2. 期望总净收益 (理论复权盈亏 - 交易手续费 - 交易滑点 + 独立换月日志中的摩擦之和)
         theoretical_pnl = sum([result.trading_pnl + result.holding_pnl for result in self.daily_results.values()])
-
-        # 2. 换月摩擦损耗 (从换月日志中提取)
-        rollover_friction = sum([log.get("rollover_pnl", 0) for log in self.rollover_logs])
-
-        # 3. 物理账本真实净盈亏, 扣除了手续费、滑点，并叠加了物理换月真实资金变化
         total_commission = sum([result.commission for result in self.daily_results.values()])
         total_slippage = sum([result.slippage for result in self.daily_results.values()])
-        real_net_pnl = theoretical_pnl - total_commission - total_slippage + rollover_friction
+        rollover_from_logs = sum([log.get("rollover_pnl", 0) for log in self.rollover_logs])
+
+        expected_net_pnl = theoretical_pnl - total_commission - total_slippage + rollover_from_logs
 
         # 核心断言逻辑 (容忍极小的浮点数误差)
         tolerance = 1e-4
-        is_consistent = abs((theoretical_pnl + rollover_friction - total_commission - total_slippage) -
-                            real_net_pnl) < tolerance
+        is_consistent = abs(actual_net_pnl - expected_net_pnl) < tolerance
 
         if is_consistent:
-            self.output("✅ 对账成功！盈亏数据真实有效。")
+            self.output("✅ 对账成功！换月损耗已正确汇入逐日结算账本。")
             return True
         else:
-            self.output("❌ 严重警告：财务对账失败！存在盈亏泄露或幽灵利润，请立刻检查复权映射逻辑！")
+            self.output(f"❌ 严重警告：财务对账失败！实际总盈亏: {actual_net_pnl:.2f}, 期望总盈亏: {expected_net_pnl:.2f}")
             return False
 
     def _normalize_lookup_dt(self, dt: datetime, trim_second: bool = False) -> datetime:
@@ -372,7 +373,8 @@ class BacktestingEngine:
         missing_routes = 0
         missing_phys = 0
         for b in self.history_data:
-            clean_dt = self._normalize_datetime(b.datetime)
+            clean_dt = self._normalize_lookup_dt(b.datetime)
+
             sym = self.bar_route_map.get(clean_dt)
             if not sym:
                 missing_routes += 1
@@ -416,8 +418,10 @@ class BacktestingEngine:
                 try:
                     func(data)
                 except Exception:
+                    self.backtest_failed = True
+                    self.backtest_error = traceback.format_exc()
                     self.output(_("触发异常，回测终止"))
-                    self.output(traceback.format_exc())
+                    self.output(self.backtest_error)
                     return
 
             progress = min((i + batch_size) / total_size, 1)
@@ -1369,7 +1373,8 @@ def load_tick_data(symbol: str, exchange: Exchange, start: datetime, end: dateti
 
 def evaluate(target_name: str, strategy_class: type[CtaTemplate], vt_symbol: str, interval: Interval, start: datetime,
              rate: float, slippage: float, size: float, pricetick: float, capital: int, end: datetime, mode: BacktestingMode,
-             annual_days: int, half_life: int, physical_symbols: list, by_volume: bool, setting: dict) -> tuple:
+             annual_days: int, half_life: int, physical_symbols: list, by_volume: bool, warmup_days: int,
+             setting: dict) -> tuple:
     engine: BacktestingEngine = BacktestingEngine()
     engine.set_parameters(vt_symbol=vt_symbol,
                           interval=interval,
@@ -1384,10 +1389,16 @@ def evaluate(target_name: str, strategy_class: type[CtaTemplate], vt_symbol: str
                           annual_days=annual_days,
                           half_life=half_life,
                           physical_symbols=physical_symbols,
-                          by_volume=by_volume)
+                          by_volume=by_volume,
+                          warmup_days=warmup_days)
     engine.add_strategy(strategy_class, setting)
     engine.load_data()
     engine.run_backtesting()
+
+    # 短路拦截：如果这一组参数导致底层 RuntimeError（如缺 K 线），直接计 0 淘汰
+    if getattr(engine, "backtest_failed", False) or getattr(engine, "data_load_failed", False):
+        return (setting, 0.0, {})
+
     engine.calculate_result()
     statistics: dict = engine.calculate_statistics(output=False)
     target_value: float = statistics.get(target_name, 0)
@@ -1398,7 +1409,7 @@ def wrap_evaluate(engine: BacktestingEngine, target_name: str) -> Callable:
     func: Callable = partial(evaluate, target_name, engine.strategy_class, engine.vt_symbol, engine.interval, engine.start,
                              engine.rate, engine.slippage, engine.size, engine.pricetick, engine.capital, engine.end,
                              engine.mode, engine.annual_days, engine.half_life, getattr(engine, 'physical_symbols', []),
-                             getattr(engine, 'by_volume', False))
+                             getattr(engine, 'by_volume', False), getattr(engine, 'warmup_days', 120))
     return func
 
 

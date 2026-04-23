@@ -87,7 +87,22 @@ def run_main() -> None:
     # 5. 执行回测
     engine.add_strategy(strategy_class, route["parameters"])
     engine.load_data()
+
+    # 数据加载失败拦截
+    if getattr(engine, "data_load_failed", False):
+        error_msg = getattr(engine, 'data_load_error', '未知错误')
+        print(f"❌ 数据加载失败: {error_msg}。回测已被中止！")
+        import sys
+        sys.exit(1)
+
     engine.run_backtesting()
+
+    # 运行时崩溃拦截
+    if getattr(engine, "backtest_failed", False):
+        error_msg = getattr(engine, 'backtest_error', '未知错误')
+        print(f"❌ 回测执行过程中发生异常: {error_msg}。拒绝生成残缺报表！")
+        import sys
+        sys.exit(1)
 
     # 6. 计算结果并生成报告
     df = engine.calculate_result()
