@@ -189,13 +189,14 @@ class BacktestingEngine:
         """获取当前 连续复权价格 与 物理合约价格 的差值"""
         if self.mode != BacktestingMode.BAR:
             return 0.0
-        if not self.current_physical_symbol or not hasattr(self, 'bar') or self.bar is None:
+        if not self.current_physical_symbol or not hasattr(self, "bar") or self.bar is None:
             return 0.0
 
-        lookup_dt = self.datetime.replace(microsecond=0)
+        # 同样使用规范化的时间戳
+        lookup_dt = self._normalize_lookup_dt(self.datetime)
         phys_bar = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
 
-        # [核心] 严格校验：缺物理K线直接抛出异常阻断，绝不容忍静默污染
+        # 【警告】修复后此处将真正执行，若本地缺失部分物理 K 线数据，将引发 RuntimeError 阻断回测
         if not phys_bar:
             error_msg = f"缺失物理K线，无法进行价格坐标转换: {self.current_physical_symbol} @ {lookup_dt}"
             self.output(f"[{self.datetime}] ❌ 严重错误: {error_msg}")
@@ -265,6 +266,16 @@ class BacktestingEngine:
         else:
             self.output("❌ 严重警告：财务对账失败！存在盈亏泄露或幽灵利润，请立刻检查复权映射逻辑！")
             return False
+
+    def _normalize_lookup_dt(self, dt: datetime, trim_second: bool = False) -> datetime:
+        """
+        统一处理查询字典用的时间戳，剥离时区并按需截断，确保与字典构建时的 key 严格一致。
+        """
+        if trim_second:
+            dt = dt.replace(second=0, microsecond=0)
+        else:
+            dt = dt.replace(microsecond=0)
+        return self._normalize_datetime(dt)
 
     def set_parameters(self,
                        vt_symbol: str,
@@ -748,11 +759,10 @@ class BacktestingEngine:
             self.daily_results[trading_date] = daily_result
 
     def _do_rollover(self) -> None:
-        if not self.routing_schedule:
-            return
+        # 强制剥离时区后再去 routing_schedule 和 physical_bars 查表
+        check_dt = self._normalize_lookup_dt(self.datetime, trim_second=(self.mode == BacktestingMode.TICK))
 
-        check_dt = self.datetime.replace(second=0, microsecond=0) if self.mode == BacktestingMode.TICK else self.datetime
-        best_symbol = self.routing_schedule.get(check_dt) or self.routing_schedule.get(check_dt.replace(microsecond=0))
+        best_symbol = self.routing_schedule.get(check_dt)
 
         if not best_symbol:
             return
@@ -910,8 +920,8 @@ class BacktestingEngine:
 
     def cross_limit_order(self) -> None:
         if self.mode == BacktestingMode.BAR:
+            lookup_dt = self._normalize_lookup_dt(self.datetime)
             if self.current_physical_symbol:
-                lookup_dt = self.datetime.replace(microsecond=0)
                 current_data = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
                 if not current_data:
                     return
@@ -971,8 +981,8 @@ class BacktestingEngine:
 
     def cross_stop_order(self) -> None:
         if self.mode == BacktestingMode.BAR:
+            lookup_dt = self._normalize_lookup_dt(self.datetime)
             if self.current_physical_symbol:
-                lookup_dt = self.datetime.replace(microsecond=0)
                 current_data = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
                 if not current_data:
                     return
