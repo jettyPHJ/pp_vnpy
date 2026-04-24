@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTA 回测报告</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+SC:wght@400;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style id="dynamic-style"></style>
+
+<script>
+document.getElementById("dynamic-style").innerHTML = `{{ STYLE_CONTENT }}`;
+</script>
+</head>
+<body>
+
+<nav class="sidebar">
+    <div class="sidebar-logo">
+        <div class="title">CTA REPORT</div>
+        <div class="sub">V1.2.1 · PHASE 1</div>
+    </div>
+    <a class="nav-item active" href="#qa"><span class="nav-icon">🛡</span>QA 审计</a>
+    <a class="nav-item" href="#mapping"><span class="nav-icon">📐</span>K 线对账</a>
+    <a class="nav-item" href="#chart"><span class="nav-icon">📈</span>收益图表</a>
+    <a class="nav-item" href="#daily"><span class="nav-icon">📅</span>日度明细</a>
+    <a class="nav-item" href="#rollover"><span class="nav-icon">🔄</span>换月审计</a>
+    <a class="nav-item" href="#orders"><span class="nav-icon">📋</span>订单记录</a>
+    <a class="nav-item" href="#trades"><span class="nav-icon">✅</span>成交记录</a>
+</nav>
+
+<div class="main">
+    <div class="page-header">
+        <h1>📊 CTA 回测验真报告</h1>
+        <span class="header-badge">PHASE 1</span>
+        <span class="header-ts">{{ TIMESTAMP }}</span>
+    </div>
+
+    {{ KPI_STRIP }}
+
+    <div class="layout-grid">
+        <div class="layout-left">
+            <div data-section="qa">{{ QA_HTML }}</div>
+            <div data-section="mapping">{{ MAPPING_HTML }}</div>
+            <div class="section-card" data-section="chart">
+                <div class="section-header">
+                    <span class="section-icon">📈</span><span>收益图表</span><span class="section-sub">净值 / 回撤 / 盈亏</span>
+                </div>
+                <div class="section-pad">{{ CHART_HTML }}</div>
+            </div>
+            <div class="section-card" data-section="daily">
+                <div class="section-header">
+                    <span class="section-icon">📅</span><span>日度结算明细</span><span class="section-sub">倒序排列</span>
+                </div>
+                <div>{{ DAILY_HTML }}</div>
+            </div>
+            <div class="section-card" data-section="rollover">
+                <div class="section-header">
+                    <span class="section-icon">🔄</span><span>换月事件审计</span><span class="section-sub">摩擦成本账本</span>
+                </div>
+                <div class="section-pad">{{ ROLLOVER_HTML }}</div>
+            </div>
+            <div class="section-card" data-section="orders">
+                <div class="section-header">
+                    <span class="section-icon">📋</span><span>订单生命周期</span>
+                </div>
+                <div>{{ ORDERS_HTML }}</div>
+            </div>
+            <div class="section-card" data-section="trades">
+                <div class="section-header">
+                    <span class="section-icon">✅</span><span>物理成交记录</span>
+                </div>
+                <div>{{ TRADES_HTML }}</div>
+            </div>
+        </div>
+
+        <div class="layout-right">
+            <div class="stats-panel">
+                <div class="stats-panel-header">📊 绩效指标</div>
+                {{ STATS_HTML }}
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>{{ SCRIPT_CONTENT }}</script>
+</body>
+</html>

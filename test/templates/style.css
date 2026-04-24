@@ -1,0 +1,229 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg:       #0b0e18;
+    --surface:  #111827;
+    --surface2: #1a2235;
+    --border:   #1e2d45;
+    --border2:  #2a3f5c;
+    --accent:   #3b82f6;
+    --accent2:  #22d3ee;
+    --gold:     #f59e0b;
+    --red:      #f87171;
+    --green:    #34d399;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --muted2:   #475569;
+    --font:     'IBM Plex Sans SC', 'PingFang SC', sans-serif;
+    --mono:     'IBM Plex Mono', 'Fira Code', monospace;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* ── 侧边导航 ── */
+.sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0;
+    width: 200px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 24px 0;
+    z-index: 100;
+    display: flex; flex-direction: column;
+}
+.sidebar-logo {
+    padding: 0 20px 20px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+}
+.sidebar-logo .title { font-size: 0.8rem; font-weight: 700; color: var(--text); letter-spacing: 0.08em; }
+.sidebar-logo .sub   { font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
+.nav-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 20px;
+    font-size: 0.75rem; color: var(--muted);
+    cursor: pointer; text-decoration: none;
+    transition: color 0.15s, background 0.15s;
+    border-left: 2px solid transparent;
+}
+.nav-item:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+.nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(59,130,246,0.06); }
+.nav-icon { width: 16px; text-align: center; opacity: 0.7; }
+
+/* ── 主内容区 ── */
+.main {
+    margin-left: 200px;
+    padding: 32px 32px 64px;
+    max-width: 1280px;
+}
+
+/* ── 顶部标题栏 ── */
+.page-header {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+}
+.page-header h1 { font-size: 1.1rem; font-weight: 600; color: var(--text); }
+.header-badge {
+    font-family: var(--mono); font-size: 0.65rem;
+    padding: 3px 10px; border-radius: 20px;
+    background: rgba(59,130,246,0.15); color: var(--accent);
+    border: 1px solid rgba(59,130,246,0.3);
+    letter-spacing: 0.05em;
+}
+.header-ts { margin-left: auto; font-size: 0.7rem; color: var(--muted); font-family: var(--mono); }
+
+/* ── KPI 横条 ── */
+.kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+}
+.kpi-cell {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    transition: border-color 0.15s;
+}
+.kpi-cell:hover { border-color: var(--border2); }
+.kpi-label { font-size: 0.7rem; color: var(--muted); margin-bottom: 6px; }
+.kpi-value { font-family: var(--mono); font-size: 1.1rem; font-weight: 600; color: var(--text); }
+.kpi-pos   { color: var(--green) !important; }
+.kpi-neg   { color: var(--red)   !important; }
+
+/* ── 主布局 ── */
+.layout-grid {
+    display: grid;
+    grid-template-columns: 1fr 280px;
+    gap: 20px;
+    align-items: start;
+}
+.layout-left  { min-width: 0; }
+.layout-right { position: sticky; top: 32px; }
+
+/* ── section 区块 ── */
+.section-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 20px;
+}
+.section-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.015);
+    font-size: 0.75rem; font-weight: 600;
+    color: var(--text); letter-spacing: 0.04em;
+}
+.section-icon { font-size: 0.9rem; }
+.section-sub  { margin-left: auto; font-size: 0.68rem; color: var(--muted); font-weight: 400; }
+
+/* ── 绩效右侧面板 ── */
+.stats-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    padding: 0 0 8px;
+}
+.stats-panel-header {
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.75rem; font-weight: 600; color: var(--text);
+    letter-spacing: 0.04em;
+    background: rgba(255,255,255,0.015);
+}
+.stat-group-label {
+    font-size: 0.65rem; color: var(--muted); letter-spacing: 0.08em;
+    padding: 10px 16px 4px;
+    text-transform: uppercase;
+}
+.stat-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.stat-row:last-child { border-bottom: none; }
+.stat-row.stat-highlight { background: rgba(245,158,11,0.04); }
+.stat-key { font-size: 0.75rem; color: var(--muted); }
+.stat-val { font-family: var(--mono); font-size: 0.78rem; color: var(--accent2); }
+.stat-highlight .stat-key { color: var(--gold); }
+.stat-highlight .stat-val { color: var(--gold); }
+
+/* ── 基础表格 ── */
+.base-table {
+    width: 100%; border-collapse: collapse;
+    font-size: 0.78rem;
+}
+.base-table th {
+    position: sticky; top: 0; z-index: 2;
+    background: #131c2e; color: var(--muted);
+    font-weight: 600; font-size: 0.68rem;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 8px 12px; white-space: nowrap; text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+.base-table td {
+    padding: 6px 12px; white-space: nowrap;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    color: var(--text);
+}
+.base-table tbody tr:hover td { background: rgba(59,130,246,0.06); }
+.mono     { font-family: var(--mono); font-size: 0.76rem; }
+.sym-cell { color: var(--accent2); }
+.sym-old  { color: var(--red);     }
+.sym-new  { color: var(--green);   }
+.pnl-pos  { color: var(--green);   }
+.pnl-neg  { color: var(--red);     }
+.diff-val { color: var(--muted2);  }
+.val-na   { color: var(--red); opacity: 0.7; }
+.event-flag { font-weight: 600; }
+.row-both     td { background: rgba(245,158,11,0.07)  !important; }
+.row-rollover td { background: rgba(245,158,11,0.05)  !important; color: var(--gold) !important; }
+.row-route    td { background: rgba(59,130,246,0.05)  !important; }
+.row-cancelled td { color: var(--red) !important; opacity: 0.8; }
+
+/* ── QA 表格 ── */
+.qa-table   { width: 100%; }
+.qa-label-zh { display: block; font-size: 0.78rem; color: var(--text); }
+.qa-label-en { display: block; font-size: 0.68rem; color: var(--muted); margin-top: 1px; font-family: var(--mono); }
+.qa-criterion { font-size: 0.7rem; color: var(--muted); }
+.qa-badge {
+    display: inline-block;
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 600;
+    padding: 3px 10px; border-radius: 12px;
+}
+.qa-pass  { background: rgba(52,211,153,0.12); color: var(--green); border: 1px solid rgba(52,211,153,0.25); }
+.qa-fail  { background: rgba(248,113,113,0.12); color: var(--red);   border: 1px solid rgba(248,113,113,0.25); }
+.qa-warn  { background: rgba(245,158,11,0.12);  color: var(--gold);  border: 1px solid rgba(245,158,11,0.25); }
+.qa-muted { background: rgba(100,116,139,0.12); color: var(--muted); border: 1px solid rgba(100,116,139,0.2); }
+
+/* ── 杂项 ── */
+.scroll-box     { max-height: 380px; overflow: auto; }
+.hint-line      { font-size: 0.72rem; color: var(--muted); padding: 8px 14px; border-bottom: 1px solid var(--border); line-height: 1.5; }
+.empty-state    { padding: 28px; text-align: center; color: var(--muted); font-size: 0.82rem; }
+.section-pad    { padding: 16px; }
+.reason-tag     { font-size: 0.65rem; background: rgba(245,158,11,0.15); color: var(--gold); padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
+
+/* ── 新增订单分类 UI CSS ── */
+.table-filter-bar { display: flex; gap: 8px; margin: 8px 16px; }
+.filter-btn { background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 4px; font-size: 0.7rem; cursor: pointer; }
+.filter-btn.active { background: rgba(59,130,246,0.15); color: var(--accent); border-color: rgba(59,130,246,0.3); }
+.row-normal { /* 保持默认 */ }
+.source-tag { font-size: 0.65rem; background: rgba(59,130,246,0.12); color: var(--accent); padding: 1px 5px; border-radius: 3px; margin-left: 4px; border: 1px solid rgba(59,130,246,0.2); }
+
+/* 折叠面板 */
+details.section-card > summary { list-style: none; cursor: pointer; outline: none; }
+details.section-card > summary::-webkit-details-marker { display: none; }

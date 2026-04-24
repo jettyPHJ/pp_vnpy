@@ -1,3 +1,4 @@
+import uuid
 import importlib
 import traceback
 from collections import defaultdict
@@ -25,35 +26,18 @@ from vnpy.trader.object import (
     TradeData,
     ContractData,
 )
-from vnpy.trader.event import (
-    EVENT_TICK,
-    EVENT_ORDER,
-    EVENT_TRADE
-)
-from vnpy.trader.constant import (
-    Direction,
-    OrderType,
-    Interval,
-    Exchange,
-    Offset,
-    Status
-)
+from vnpy.trader.event import (EVENT_TICK, EVENT_ORDER, EVENT_TRADE)
+from vnpy.trader.constant import (Direction, OrderType, Interval, Exchange, Offset, Status)
 from vnpy.trader.utility import load_json, save_json, extract_vt_symbol, round_to
 from vnpy.trader.database import BaseDatabase, get_database, DB_TZ
 from vnpy.trader.datafeed import BaseDatafeed, get_datafeed
 
-from .base import (
-    APP_NAME,
-    EVENT_CTA_LOG,
-    EVENT_CTA_STRATEGY,
-    EVENT_CTA_STOPORDER,
-    EngineType,
-    StopOrder,
-    StopOrderStatus,
-    STOPORDER_PREFIX
-)
+from .base import (APP_NAME, EVENT_CTA_LOG, EVENT_CTA_STRATEGY, EVENT_CTA_STOPORDER, EngineType, StopOrder, StopOrderStatus,
+                   STOPORDER_PREFIX)
 from .template import CtaTemplate, TargetPosTemplate
 from .locale import _
+from .order_flow.models import SignalOrder, OrderSource, RiskDecision, PhysicalOrderRef
+from .order_flow.pipeline_stubs import DummyRiskManager, ExecutionAdapter
 
 # 停止单状态映射
 STOP_STATUS_MAP: dict[Status, StopOrderStatus] = {
@@ -78,25 +62,51 @@ class CtaEngine(BaseEngine):
         """"""
         super().__init__(main_engine, event_engine, APP_NAME)
 
-        self.strategy_setting: dict = {}                                # strategy_name: dict
-        self.strategy_data: dict = {}                                   # strategy_name: dict
+        self.strategy_setting: dict = {}  # strategy_name: dict
+        self.strategy_data: dict = {}  # strategy_name: dict
 
-        self.classes: dict = {}                                         # class_name: stategy_class
-        self.strategies: dict = {}                                      # strategy_name: strategy
+        self.classes: dict = {}  # class_name: stategy_class
+        self.strategies: dict = {}  # strategy_name: strategy
 
-        self.symbol_strategy_map: defaultdict = defaultdict(list)       # vt_symbol: strategy list
-        self.orderid_strategy_map: dict = {}                            # vt_orderid: strategy
-        self.strategy_orderid_map: defaultdict = defaultdict(set)       # strategy_name: orderid set
+        self.symbol_strategy_map: defaultdict = defaultdict(list)  # vt_symbol: strategy list
+        self.orderid_strategy_map: dict = {}  # vt_orderid: strategy
+        self.strategy_orderid_map: defaultdict = defaultdict(set)  # strategy_name: orderid set
 
-        self.stop_order_count: int = 0                                  # for generating stop_orderid
-        self.stop_orders: dict[str, StopOrder] = {}                     # stop_orderid: stop_order
+        self.stop_order_count: int = 0  # for generating stop_orderid
+        self.stop_orders: dict[str, StopOrder] = {}  # stop_orderid: stop_order
 
         self.init_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
-        self.vt_tradeids: set = set()                                   # for filtering duplicate trade
+        self.vt_tradeids: set = set()  # for filtering duplicate trade
 
         self.database: BaseDatabase = get_database()
         self.datafeed: BaseDatafeed = get_datafeed()
+
+        # ==========================================
+        # V1.3 新增：管道组件实例化
+        # ==========================================
+        self.risk_manager = DummyRiskManager(reject_keywords={"MALICIOUS_TEST"})
+        self.execution_adapter = ExecutionAdapter()
+
+        # ==========================================
+        # V1.3 新增：映射内存与可观测性
+        # ==========================================
+        # orderid_chain_map: 仅用于 process_trade_event 时对 O(1) 反向查找 chain_id。
+        self.orderid_chain_map: dict[str, str] = {}
+
+        # chain_audit_map: 完整血缘与审计信息。
+        # 内部层级: ["signal", "risk", "executions", "orders", "trades"]
+        self.chain_audit_map: dict[str, dict] = {}
+
+        # 统计指标：静默记录未走 V1.3 管道的底层成交（如止损单触发）
+        self.untracked_trade_count: int = 0
+
+        # TODO(Phase 3): 增加审计 Map 的 TTL 清理机制。实盘长期运行有内存泄露风险。
+        # 清理策略建议：按 chain_id 对应成交完结时间做 LRU，或每日盘后定时归档清空。
+
+    def _init_chain_audit(self, signal: SignalOrder) -> None:
+        """Helper 方法：初始化审计链字典结构，防止拼写错误"""
+        self.chain_audit_map[signal.chain_id] = {"signal": signal, "risk": None, "executions": [], "orders": [], "trades": []}
 
     def init_engine(self) -> None:
         """"""
@@ -128,19 +138,12 @@ class CtaEngine(BaseEngine):
         if result:
             self.write_log(_("数据服务初始化成功"))
 
-    def query_bar_from_datafeed(
-        self, symbol: str, exchange: Exchange, interval: Interval, start: datetime, end: datetime
-    ) -> list[BarData]:
+    def query_bar_from_datafeed(self, symbol: str, exchange: Exchange, interval: Interval, start: datetime,
+                                end: datetime) -> list[BarData]:
         """
         Query bar data from datafeed.
         """
-        req: HistoryRequest = HistoryRequest(
-            symbol=symbol,
-            exchange=exchange,
-            interval=interval,
-            start=start,
-            end=end
-        )
+        req: HistoryRequest = HistoryRequest(symbol=symbol, exchange=exchange, interval=interval, start=start, end=end)
         data: list[BarData] = self.datafeed.query_bar_history(req, self.write_log)
         return data
 
@@ -175,13 +178,13 @@ class CtaEngine(BaseEngine):
         if order.type == OrderType.STOP:
             so: StopOrder = StopOrder(
                 vt_symbol=order.vt_symbol,
-                direction=order.direction,      # type: ignore
+                direction=order.direction,  # type: ignore
                 offset=order.offset,
                 price=order.price,
                 volume=order.volume,
                 stop_orderid=order.vt_orderid,
                 strategy_name=strategy.strategy_name,
-                datetime=order.datetime,        # type: ignore
+                datetime=order.datetime,  # type: ignore
                 status=STOP_STATUS_MAP[order.status],
                 vt_orderids=[order.vt_orderid],
             )
@@ -191,10 +194,7 @@ class CtaEngine(BaseEngine):
         self.call_strategy_func(strategy, strategy.on_order, order)
 
     def process_trade_event(self, event: Event) -> None:
-        """"""
         trade: TradeData = event.data
-
-        # Filter duplicate trade push
         if trade.vt_tradeid in self.vt_tradeids:
             return
         self.vt_tradeids.add(trade.vt_tradeid)
@@ -203,18 +203,27 @@ class CtaEngine(BaseEngine):
         if not strategy:
             return
 
-        # Update strategy pos before calling on_trade method
+        # ==========================================
+        # V1.3 审计链闭环与可观测性
+        # ==========================================
+        chain_id = self.orderid_chain_map.get(trade.vt_orderid)
+        if chain_id and chain_id in self.chain_audit_map:
+            self.chain_audit_map[chain_id]["trades"].append(trade)
+        else:
+            # 静默计数：记录未进入 V1.3 Pipeline 的成交量（不写 log，防刷屏）
+            self.untracked_trade_count += 1
+
+        # ==========================================
+        # 唯一真相来源 (Single Source of Truth)
+        # 声明：V1.3 尚未剥离 target_pos，当前的 strategy.pos 逻辑上兼任 actual_pos
+        # ==========================================
         if trade.direction == Direction.LONG:
             strategy.pos += trade.volume
         else:
             strategy.pos -= trade.volume
 
         self.call_strategy_func(strategy, strategy.on_trade, trade)
-
-        # Sync strategy variables to data file
         self.sync_strategy_data(strategy)
-
-        # Update GUI
         self.put_strategy_event(strategy)
 
     def check_stop_order(self, tick: TickData) -> None:
@@ -223,12 +232,8 @@ class CtaEngine(BaseEngine):
             if stop_order.vt_symbol != tick.vt_symbol:
                 continue
 
-            long_triggered = (
-                stop_order.direction == Direction.LONG and tick.last_price >= stop_order.price
-            )
-            short_triggered = (
-                stop_order.direction == Direction.SHORT and tick.last_price <= stop_order.price
-            )
+            long_triggered = (stop_order.direction == Direction.LONG and tick.last_price >= stop_order.price)
+            short_triggered = (stop_order.direction == Direction.SHORT and tick.last_price <= stop_order.price)
 
             if long_triggered or short_triggered:
                 strategy: CtaTemplate = self.strategies[stop_order.strategy_name]
@@ -251,16 +256,12 @@ class CtaEngine(BaseEngine):
                 if not contract:
                     continue
 
-                vt_orderids: list = self.send_limit_order(
-                    strategy,
-                    contract,
-                    stop_order.direction,
-                    stop_order.offset,
-                    price,
-                    stop_order.volume,
-                    stop_order.lock,
-                    stop_order.net
-                )
+                # ⚠️ V1.3 架构豁免声明：由于止损单绕过 Pipeline，此处打印单条提醒日志
+                self.write_log(f"【V1.3 豁免】止损被触发，跳过审计管道直接发单: {stop_order.stop_orderid}", strategy)
+
+                # 修复占位符错误，使用完整参数发单
+                vt_orderids: list = self.send_limit_order(strategy, contract, stop_order.direction, stop_order.offset, price,
+                                                          stop_order.volume, stop_order.lock, stop_order.net)
 
                 # Update stop order status if placed successfully
                 if vt_orderids:
@@ -275,45 +276,26 @@ class CtaEngine(BaseEngine):
                     stop_order.status = StopOrderStatus.TRIGGERED
                     stop_order.vt_orderids = vt_orderids
 
-                    self.call_strategy_func(
-                        strategy, strategy.on_stop_order, stop_order
-                    )
+                    self.call_strategy_func(strategy, strategy.on_stop_order, stop_order)
                     self.put_stop_order_event(stop_order)
 
-    def send_server_order(
-        self,
-        strategy: CtaTemplate,
-        contract: ContractData,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        type: OrderType,
-        lock: bool,
-        net: bool
-    ) -> list:
+    def send_server_order(self, strategy: CtaTemplate, contract: ContractData, direction: Direction, offset: Offset,
+                          price: float, volume: float, type: OrderType, lock: bool, net: bool) -> list:
         """
         Send a new order to server.
         """
         # Create request and send order.
-        original_req: OrderRequest = OrderRequest(
-            symbol=contract.symbol,
-            exchange=contract.exchange,
-            direction=direction,
-            offset=offset,
-            type=type,
-            price=price,
-            volume=volume,
-            reference=f"{APP_NAME}_{strategy.strategy_name}"
-        )
+        original_req: OrderRequest = OrderRequest(symbol=contract.symbol,
+                                                  exchange=contract.exchange,
+                                                  direction=direction,
+                                                  offset=offset,
+                                                  type=type,
+                                                  price=price,
+                                                  volume=volume,
+                                                  reference=f"{APP_NAME}_{strategy.strategy_name}")
 
         # Convert with offset converter
-        req_list: list[OrderRequest] = self.main_engine.convert_order_request(
-            original_req,
-            contract.gateway_name,
-            lock,
-            net
-        )
+        req_list: list[OrderRequest] = self.main_engine.convert_order_request(original_req, contract.gateway_name, lock, net)
 
         # Send Orders
         vt_orderids: list = []
@@ -335,89 +317,41 @@ class CtaEngine(BaseEngine):
 
         return vt_orderids
 
-    def send_limit_order(
-        self,
-        strategy: CtaTemplate,
-        contract: ContractData,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        lock: bool,
-        net: bool
-    ) -> list:
+    def send_limit_order(self, strategy: CtaTemplate, contract: ContractData, direction: Direction, offset: Offset,
+                         price: float, volume: float, lock: bool, net: bool) -> list:
         """
         Send a limit order to server.
         """
-        return self.send_server_order(
-            strategy,
-            contract,
-            direction,
-            offset,
-            price,
-            volume,
-            OrderType.LIMIT,
-            lock,
-            net
-        )
+        return self.send_server_order(strategy, contract, direction, offset, price, volume, OrderType.LIMIT, lock, net)
 
-    def send_server_stop_order(
-        self,
-        strategy: CtaTemplate,
-        contract: ContractData,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        lock: bool,
-        net: bool
-    ) -> list:
+    def send_server_stop_order(self, strategy: CtaTemplate, contract: ContractData, direction: Direction, offset: Offset,
+                               price: float, volume: float, lock: bool, net: bool) -> list:
         """
         Send a stop order to server.
 
         Should only be used if stop order supported
         on the trading server.
         """
-        return self.send_server_order(
-            strategy,
-            contract,
-            direction,
-            offset,
-            price,
-            volume,
-            OrderType.STOP,
-            lock,
-            net
-        )
+        return self.send_server_order(strategy, contract, direction, offset, price, volume, OrderType.STOP, lock, net)
 
-    def send_local_stop_order(
-        self,
-        strategy: CtaTemplate,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        lock: bool,
-        net: bool
-    ) -> list:
+    def send_local_stop_order(self, strategy: CtaTemplate, direction: Direction, offset: Offset, price: float, volume: float,
+                              lock: bool, net: bool) -> list:
         """
         Create a new local stop order.
         """
         self.stop_order_count += 1
         stop_orderid: str = f"{STOPORDER_PREFIX}.{self.stop_order_count}"
 
-        stop_order: StopOrder = StopOrder(
-            vt_symbol=strategy.vt_symbol,
-            direction=direction,
-            offset=offset,
-            price=price,
-            volume=volume,
-            stop_orderid=stop_orderid,
-            strategy_name=strategy.strategy_name,
-            datetime=datetime.now(DB_TZ),
-            lock=lock,
-            net=net
-        )
+        stop_order: StopOrder = StopOrder(vt_symbol=strategy.vt_symbol,
+                                          direction=direction,
+                                          offset=offset,
+                                          price=price,
+                                          volume=volume,
+                                          stop_orderid=stop_orderid,
+                                          strategy_name=strategy.strategy_name,
+                                          datetime=datetime.now(DB_TZ),
+                                          lock=lock,
+                                          net=net)
 
         self.stop_orders[stop_orderid] = stop_order
 
@@ -463,41 +397,65 @@ class CtaEngine(BaseEngine):
         self.call_strategy_func(strategy, strategy.on_stop_order, stop_order)
         self.put_stop_order_event(stop_order)
 
-    def send_order(
-        self,
-        strategy: CtaTemplate,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        stop: bool,
-        lock: bool,
-        net: bool
-    ) -> list:
-        """
-        """
+    def send_order(self, strategy: CtaTemplate, direction: Direction, offset: Offset, price: float, volume: float, stop: bool,
+                   lock: bool, net: bool) -> list:
         contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
         if not contract:
             self.write_log(_("委托失败，找不到合约：{}").format(strategy.vt_symbol), strategy)
             return []
 
-        # Round order price and volume to nearest incremental value
-        price = round_to(price, contract.pricetick)
-        volume = round_to(volume, contract.min_volume)
-
+        # ==========================================
+        # 豁免分支：跳过 V1.3 审计管道 (保持原生实现逻辑)
+        # ==========================================
         if stop:
+            price = round_to(price, contract.pricetick)
+            volume = round_to(volume, contract.min_volume)
             if contract.stop_supported:
-                return self.send_server_stop_order(
-                    strategy, contract, direction, offset, price, volume, lock, net
-                )
+                return self.send_server_stop_order(strategy, contract, direction, offset, price, volume, lock, net)
             else:
-                return self.send_local_stop_order(
-                    strategy, direction, offset, price, volume, lock, net
-                )
-        else:
-            return self.send_limit_order(
-                strategy, contract, direction, offset, price, volume, lock, net
-            )
+                return self.send_local_stop_order(strategy, direction, offset, price, volume, lock, net)
+
+        # ==========================================
+        # V1.3 核心管道：常规策略订单
+        # ==========================================
+        # 1. 意图捕获
+        chain_id = str(uuid.uuid4())
+        signal = SignalOrder(chain_id=chain_id,
+                             source=OrderSource.STRATEGY,
+                             strategy_name=strategy.strategy_name,
+                             vt_symbol=strategy.vt_symbol,
+                             direction=direction,
+                             offset=offset,
+                             price=price,
+                             volume=volume,
+                             lock=lock,
+                             net=net)
+        self._init_chain_audit(signal)
+
+        # 2. 风控审批
+        risk_order = self.risk_manager.evaluate(signal)
+        self.chain_audit_map[chain_id]["risk"] = risk_order
+
+        if risk_order.decision == RiskDecision.REJECT:
+            self.write_log(f"【风控阻断】链ID {chain_id}: {risk_order.reject_reason}", strategy)
+            return []
+
+        # 3. 执行适配
+        exec_order = self.execution_adapter.map_order(signal, contract)
+        self.chain_audit_map[chain_id]["executions"].append(exec_order)
+
+        # 4. 物理委托发送
+        vt_orderids = self.send_limit_order(strategy, contract, exec_order.direction, exec_order.offset,
+                                            exec_order.rounded_price, exec_order.rounded_volume, exec_order.lock,
+                                            exec_order.net)
+
+        # 5. 血缘绑定入库
+        for orderid in vt_orderids:
+            self.orderid_chain_map[orderid] = chain_id
+            order_ref = PhysicalOrderRef(vt_orderid=orderid, chain_id=chain_id, exec_id=exec_order.exec_id)
+            self.chain_audit_map[chain_id]["orders"].append(order_ref)
+
+        return vt_orderids
 
     def cancel_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
         """
@@ -540,18 +498,12 @@ class CtaEngine(BaseEngine):
         contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
 
         if contract:
-            return contract.size       # type: ignore
+            return contract.size  # type: ignore
         else:
             return None
 
-    def load_bar(
-        self,
-        vt_symbol: str,
-        days: int,
-        interval: Interval,
-        callback: Callable[[BarData], None],
-        use_database: bool
-    ) -> list[BarData]:
+    def load_bar(self, vt_symbol: str, days: int, interval: Interval, callback: Callable[[BarData], None],
+                 use_database: bool) -> list[BarData]:
         """"""
         symbol, exchange = extract_vt_symbol(vt_symbol)
         end: datetime = datetime.now(DB_TZ)
@@ -564,13 +516,7 @@ class CtaEngine(BaseEngine):
             contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
 
             if contract and contract.history_data:
-                req: HistoryRequest = HistoryRequest(
-                    symbol=symbol,
-                    exchange=exchange,
-                    interval=interval,
-                    start=start,
-                    end=end
-                )
+                req: HistoryRequest = HistoryRequest(symbol=symbol, exchange=exchange, interval=interval, start=start, end=end)
                 bars = self.main_engine.query_history(req, contract.gateway_name)
 
             # Try to query bars from datafeed, if not found, load from database.
@@ -588,12 +534,7 @@ class CtaEngine(BaseEngine):
 
         return bars
 
-    def load_tick(
-        self,
-        vt_symbol: str,
-        days: int,
-        callback: Callable[[TickData], None]
-    ) -> list[TickData]:
+    def load_tick(self, vt_symbol: str, days: int, callback: Callable[[TickData], None]) -> list[TickData]:
         """"""
         symbol, exchange = extract_vt_symbol(vt_symbol)
         end: datetime = datetime.now(DB_TZ)
@@ -608,9 +549,7 @@ class CtaEngine(BaseEngine):
 
         return ticks
 
-    def call_strategy_func(
-        self, strategy: CtaTemplate, func: Callable, params: Any = None
-    ) -> None:
+    def call_strategy_func(self, strategy: CtaTemplate, func: Callable, params: Any = None) -> None:
         """
         Call function of a strategy and catch any exception raised.
         """
@@ -626,9 +565,7 @@ class CtaEngine(BaseEngine):
             msg: str = _("触发异常已停止\n{}").format(traceback.format_exc())
             self.write_log(msg, strategy)
 
-    def add_strategy(
-        self, class_name: str, strategy_name: str, vt_symbol: str, setting: dict
-    ) -> None:
+    def add_strategy(self, class_name: str, strategy_name: str, vt_symbol: str, setting: dict) -> None:
         """
         Add a new strategy.
         """
@@ -694,8 +631,7 @@ class CtaEngine(BaseEngine):
         # Subscribe market data
         contract: ContractData | None = self.main_engine.get_contract(strategy.vt_symbol)
         if contract:
-            req: SubscribeRequest = SubscribeRequest(
-                symbol=contract.symbol, exchange=contract.exchange)
+            req: SubscribeRequest = SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange)
             self.main_engine.subscribe(req, contract.gateway_name)
         else:
             self.write_log(_("行情订阅失败，找不到合约{}").format(strategy.vt_symbol), strategy)
@@ -745,6 +681,8 @@ class CtaEngine(BaseEngine):
 
         # Update GUI
         self.put_strategy_event(strategy)
+
+        self.write_log(f"管道外成交累计: {self.untracked_trade_count} 笔")
 
     def edit_strategy(self, strategy_name: str, setting: dict) -> None:
         """
@@ -820,11 +758,8 @@ class CtaEngine(BaseEngine):
 
             for name in dir(module):
                 value = getattr(module, name)
-                if (
-                    isinstance(value, type)
-                    and issubclass(value, CtaTemplate)
-                    and value not in {CtaTemplate, TargetPosTemplate}
-                ):
+                if (isinstance(value, type) and issubclass(value, CtaTemplate)
+                        and value not in {CtaTemplate, TargetPosTemplate}):
                     self.classes[value.__name__] = value
         except:  # noqa
             msg: str = _("策略文件{}加载失败，触发异常：\n{}").format(module_name, traceback.format_exc())
@@ -841,7 +776,7 @@ class CtaEngine(BaseEngine):
         Sync strategy data into json file.
         """
         data: dict = strategy.get_variables()
-        data.pop("inited")      # Strategy status (inited, trading) should not be synced.
+        data.pop("inited")  # Strategy status (inited, trading) should not be synced.
         data.pop("trading")
 
         self.strategy_data[strategy.strategy_name] = data
@@ -899,12 +834,8 @@ class CtaEngine(BaseEngine):
         self.strategy_setting = load_json(self.setting_filename)
 
         for strategy_name, strategy_config in self.strategy_setting.items():
-            self.add_strategy(
-                strategy_config["class_name"],
-                strategy_name,
-                strategy_config["vt_symbol"],
-                strategy_config["setting"]
-            )
+            self.add_strategy(strategy_config["class_name"], strategy_name, strategy_config["vt_symbol"],
+                              strategy_config["setting"])
 
     def update_strategy_setting(self, strategy_name: str, setting: dict) -> None:
         """

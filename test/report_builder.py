@@ -22,10 +22,18 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
+import html
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 内部工具
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _normalize_dt(dt):
+    if dt is None: return None
+    ts = pd.Timestamp(dt)
+    if ts.tzinfo is not None: ts = ts.tz_convert(None)
+    return ts
 
 
 def _norm_dt(dt):
@@ -35,15 +43,6 @@ def _norm_dt(dt):
     if hasattr(dt, "to_pydatetime"):
         dt = dt.to_pydatetime()
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
-
-
-def _normalize_dt(dt):
-    if dt is None:
-        return pd.Timestamp.min
-    ts = pd.Timestamp(dt)
-    if ts.tzinfo is not None:
-        ts = ts.tz_convert(None)
-    return ts
 
 
 def _fmt_stat(key, val):
@@ -220,21 +219,21 @@ def _build_stats_panel(stats: dict) -> str:
 
     HIGHLIGHT = {"all_in_commission", "all_in_slippage", "rollover_count"}
 
-    html = []
+    parts = []
     for group_name, keys in GROUPS:
-        html.append(f"<div class='stat-group-label'>{group_name}</div>")
+        parts.append(f"<div class='stat-group-label'>{group_name}</div>")
         for label, k in keys:
             if k not in stats:
                 continue
             val = _fmt_stat(k, stats[k])
             hl = " stat-highlight" if k in HIGHLIGHT else ""
-            html.append(f"""
+            parts.append(f"""
             <div class="stat-row{hl}">
                 <span class="stat-key">{label}</span>
                 <span class="stat-val">{val}</span>
             </div>""")
 
-    return "\n".join(html)
+    return "\n".join(parts)
 
 
 def _build_chart(engine, df) -> str:
@@ -443,21 +442,27 @@ def _build_rollover_audit(engine) -> str:
 
 
 def _build_orders_table(engine) -> str:
+    audit_logs = getattr(engine, "order_audit_logs", {})
     all_orders = []
+
     for o in engine.get_all_orders():
-        sym = getattr(o, "vt_symbol", o.symbol)
+        audit = audit_logs.get(o.vt_orderid, {})
         all_orders.append({
             "dt": o.datetime,
-            "sym": sym,
+            "sym": getattr(o, "vt_symbol", o.symbol),
             "type": "Limit",
             "dir": o.direction.value,
             "off": o.offset.value,
             "price": o.price,
             "vol": o.volume,
             "status": str(o.status.value),
-            "reason": ""
+            "source": audit.get("status_source", ""),
+            "reason": audit.get("status_reason", "")
         })
+
     for so in engine.get_all_stop_orders():
+        reason = getattr(so, "cancel_reason", "")
+        source = getattr(so, "cancel_source", "Strategy") if reason else ""
         all_orders.append({
             "dt": so.datetime,
             "sym": so.vt_symbol,
@@ -467,30 +472,67 @@ def _build_orders_table(engine) -> str:
             "price": so.price,
             "vol": so.volume,
             "status": str(so.status.value),
-            "reason": getattr(so, "cancel_reason", "")
+            "source": source,
+            "reason": reason
         })
 
-    all_orders.sort(key=lambda x: _normalize_dt(x["dt"]))
-    if not all_orders:
-        return "<div class='empty-state'>无委托记录</div>"
+    for bo in getattr(engine, "warmup_blocked_orders", []):
+        all_orders.append({
+            "dt": bo["datetime"],
+            "sym": "N/A",
+            "type": bo["type"].capitalize(),
+            "dir": "N/A",
+            "off": "N/A",
+            "price": 0.0,
+            "vol": 0,
+            "status": "BLOCKED",
+            "source": "Engine_Interceptor",
+            "reason": f"{bo['reason']} ({bo['phase']})"
+        })
 
+    all_orders.sort(key=lambda x: _normalize_dt(x["dt"]) if x["dt"] else pd.Timestamp.min)
+    if not all_orders: return "<div class='empty-state'>无委托记录</div>"
+
+    limit_count = sum(1 for o in all_orders if o["type"] == "Limit")
+    stop_count = sum(1 for o in all_orders if o["type"] == "Stop")
+    abnormal_count = 0
     rows = []
-    for o in all_orders:
-        is_cancelled = "撤销" in o["status"] or "CANCEL" in o["status"].upper()
-        rc = " class='row-cancelled'" if is_cancelled else ""
-        badge = (f"<span class='reason-tag'>{o['reason']}</span>" if o["reason"] else "")
-        dt_str = _normalize_dt(o["dt"]).strftime("%Y-%m-%d %H:%M")
-        rows.append(f"<tr{rc}><td class='mono'>{dt_str}</td><td class='mono sym-cell'>{o['sym']}</td>"
-                    f"<td>{o['type']}</td><td>{o['dir']}</td><td>{o['off']}</td>"
-                    f"<td class='mono'>{o['price']:.2f}</td><td>{o['vol']}</td>"
-                    f"<td>{o['status']}{badge}</td></tr>")
 
-    return f"""<div class="scroll-box">
+    for o in all_orders:
+        st_up = o["status"].upper()
+        is_abnormal = ("撤销" in o["status"] or "拒单" in o["status"] or "CANCEL" in st_up or "REJECT" in st_up
+                       or "BLOCKED" in st_up)
+        if is_abnormal: abnormal_count += 1
+
+        row_cls = "row-cancelled" if is_abnormal else "row-normal"
+        badge = ""
+        if o["reason"]: badge += f"<span class='reason-tag'>{html.escape(o['reason'])}</span>"
+        if o["source"]: badge += f"<span class='source-tag'>{html.escape(o['source'])}</span>"
+
+        raw_dt = o["dt"]
+        dt_str = _normalize_dt(raw_dt).strftime("%Y-%m-%d %H:%M") if raw_dt is not None else "N/A"
+
+        rows.append(
+            f"<tr class='{row_cls}' data-type='{o['type'].lower()}' data-abnormal='{'true' if is_abnormal else 'false'}'>"
+            f"<td class='mono'>{dt_str}</td><td class='mono sym-cell'>{html.escape(str(o['sym']))}</td>"
+            f"<td>{o['type']}</td><td>{o['dir']}</td><td>{o['off']}</td>"
+            f"<td class='mono'>{o['price']:.2f}</td><td>{o['vol']}</td>"
+            f"<td>{html.escape(o['status'])}{badge}</td></tr>")
+
+    return f"""
+    <div class="table-filter-bar" data-filter-group="orders">
+        <button class="filter-btn active" data-filter="all">全部 ({len(all_orders)})</button>
+        <button class="filter-btn" data-filter="limit">限价单 ({limit_count})</button>
+        <button class="filter-btn" data-filter="stop">止损单 ({stop_count})</button>
+        <button class="filter-btn" data-filter="abnormal">异常/拦截 ({abnormal_count})</button>
+    </div>
+    <div class="scroll-box">
         <table class="base-table">
             <thead><tr><th>发单时间</th><th>合约</th><th>类型</th><th>方向</th>
-            <th>动作</th><th>价格</th><th>数量</th><th>状态</th></tr></thead>
+            <th>动作</th><th>价格</th><th>数量</th><th>状态/审计归因</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
-        </table></div>"""
+        </table>
+    </div>"""
 
 
 def _build_trades_table(engine) -> str:
@@ -541,261 +583,12 @@ def _build_daily_results_table(df) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CSS
-# ──────────────────────────────────────────────────────────────────────────────
-
-_STYLE = """
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-:root {
-    --bg:       #0b0e18;
-    --surface:  #111827;
-    --surface2: #1a2235;
-    --border:   #1e2d45;
-    --border2:  #2a3f5c;
-    --accent:   #3b82f6;
-    --accent2:  #22d3ee;
-    --gold:     #f59e0b;
-    --red:      #f87171;
-    --green:    #34d399;
-    --text:     #e2e8f0;
-    --muted:    #64748b;
-    --muted2:   #475569;
-    --font:     'IBM Plex Sans SC', 'PingFang SC', sans-serif;
-    --mono:     'IBM Plex Mono', 'Fira Code', monospace;
-}
-
-html { scroll-behavior: smooth; }
-
-body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font);
-    font-size: 13px;
-    line-height: 1.6;
-}
-
-/* ── 侧边导航 ── */
-.sidebar {
-    position: fixed; left: 0; top: 0; bottom: 0;
-    width: 200px;
-    background: var(--surface);
-    border-right: 1px solid var(--border);
-    padding: 24px 0;
-    z-index: 100;
-    display: flex; flex-direction: column;
-}
-.sidebar-logo {
-    padding: 0 20px 20px;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 12px;
-}
-.sidebar-logo .title { font-size: 0.8rem; font-weight: 700; color: var(--text); letter-spacing: 0.08em; }
-.sidebar-logo .sub   { font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
-.nav-item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 8px 20px;
-    font-size: 0.75rem; color: var(--muted);
-    cursor: pointer; text-decoration: none;
-    transition: color 0.15s, background 0.15s;
-    border-left: 2px solid transparent;
-}
-.nav-item:hover { color: var(--text); background: rgba(255,255,255,0.04); }
-.nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(59,130,246,0.06); }
-.nav-icon { width: 16px; text-align: center; opacity: 0.7; }
-
-/* ── 主内容区 ── */
-.main {
-    margin-left: 200px;
-    padding: 32px 32px 64px;
-    max-width: 1280px;
-}
-
-/* ── 顶部标题栏 ── */
-.page-header {
-    display: flex; align-items: center; gap: 12px;
-    margin-bottom: 28px;
-    padding-bottom: 20px;
-    border-bottom: 1px solid var(--border);
-}
-.page-header h1 { font-size: 1.1rem; font-weight: 600; color: var(--text); }
-.header-badge {
-    font-family: var(--mono); font-size: 0.65rem;
-    padding: 3px 10px; border-radius: 20px;
-    background: rgba(59,130,246,0.15); color: var(--accent);
-    border: 1px solid rgba(59,130,246,0.3);
-    letter-spacing: 0.05em;
-}
-.header-ts { margin-left: auto; font-size: 0.7rem; color: var(--muted); font-family: var(--mono); }
-
-/* ── KPI 横条 ── */
-.kpi-strip {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 12px;
-    margin-bottom: 24px;
-}
-.kpi-cell {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    transition: border-color 0.15s;
-}
-.kpi-cell:hover { border-color: var(--border2); }
-.kpi-label { font-size: 0.7rem; color: var(--muted); margin-bottom: 6px; }
-.kpi-value { font-family: var(--mono); font-size: 1.1rem; font-weight: 600; color: var(--text); }
-.kpi-pos   { color: var(--green) !important; }
-.kpi-neg   { color: var(--red)   !important; }
-
-/* ── 主布局 ── */
-.layout-grid {
-    display: grid;
-    grid-template-columns: 1fr 280px;
-    gap: 20px;
-    align-items: start;
-}
-.layout-left  { min-width: 0; }
-.layout-right { position: sticky; top: 32px; }
-
-/* ── section 区块 ── */
-.section-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    margin-bottom: 20px;
-}
-.section-header {
-    display: flex; align-items: center; gap: 8px;
-    padding: 11px 16px;
-    border-bottom: 1px solid var(--border);
-    background: rgba(255,255,255,0.015);
-    font-size: 0.75rem; font-weight: 600;
-    color: var(--text); letter-spacing: 0.04em;
-}
-.section-icon { font-size: 0.9rem; }
-.section-sub  { margin-left: auto; font-size: 0.68rem; color: var(--muted); font-weight: 400; }
-
-/* ── 绩效右侧面板 ── */
-.stats-panel {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    overflow: hidden;
-    padding: 0 0 8px;
-}
-.stats-panel-header {
-    padding: 11px 16px;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.75rem; font-weight: 600; color: var(--text);
-    letter-spacing: 0.04em;
-    background: rgba(255,255,255,0.015);
-}
-.stat-group-label {
-    font-size: 0.65rem; color: var(--muted); letter-spacing: 0.08em;
-    padding: 10px 16px 4px;
-    text-transform: uppercase;
-}
-.stat-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 5px 16px;
-    border-bottom: 1px solid rgba(255,255,255,0.03);
-}
-.stat-row:last-child { border-bottom: none; }
-.stat-row.stat-highlight { background: rgba(245,158,11,0.04); }
-.stat-key { font-size: 0.75rem; color: var(--muted); }
-.stat-val { font-family: var(--mono); font-size: 0.78rem; color: var(--accent2); }
-.stat-highlight .stat-key { color: var(--gold); }
-.stat-highlight .stat-val { color: var(--gold); }
-
-/* ── 基础表格 ── */
-.base-table {
-    width: 100%; border-collapse: collapse;
-    font-size: 0.78rem;
-}
-.base-table th {
-    position: sticky; top: 0; z-index: 2;
-    background: #131c2e; color: var(--muted);
-    font-weight: 600; font-size: 0.68rem;
-    letter-spacing: 0.06em; text-transform: uppercase;
-    padding: 8px 12px; white-space: nowrap; text-align: left;
-    border-bottom: 1px solid var(--border);
-}
-.base-table td {
-    padding: 6px 12px; white-space: nowrap;
-    border-bottom: 1px solid rgba(255,255,255,0.03);
-    color: var(--text);
-}
-.base-table tbody tr:hover td { background: rgba(59,130,246,0.06); }
-.mono     { font-family: var(--mono); font-size: 0.76rem; }
-.sym-cell { color: var(--accent2); }
-.sym-old  { color: var(--red);     }
-.sym-new  { color: var(--green);   }
-.pnl-pos  { color: var(--green);   }
-.pnl-neg  { color: var(--red);     }
-.diff-val { color: var(--muted2);  }
-.val-na   { color: var(--red); opacity: 0.7; }
-.event-flag { font-weight: 600; }
-.row-both     td { background: rgba(245,158,11,0.07)  !important; }
-.row-rollover td { background: rgba(245,158,11,0.05)  !important; color: var(--gold) !important; }
-.row-route    td { background: rgba(59,130,246,0.05)  !important; }
-.row-cancelled td { color: var(--red) !important; opacity: 0.8; }
-
-/* ── QA 表格 ── */
-.qa-table   { width: 100%; }
-.qa-label-zh { display: block; font-size: 0.78rem; color: var(--text); }
-.qa-label-en { display: block; font-size: 0.68rem; color: var(--muted); margin-top: 1px; font-family: var(--mono); }
-.qa-criterion { font-size: 0.7rem; color: var(--muted); }
-.qa-badge {
-    display: inline-block;
-    font-family: var(--mono); font-size: 0.72rem; font-weight: 600;
-    padding: 3px 10px; border-radius: 12px;
-}
-.qa-pass  { background: rgba(52,211,153,0.12); color: var(--green); border: 1px solid rgba(52,211,153,0.25); }
-.qa-fail  { background: rgba(248,113,113,0.12); color: var(--red);   border: 1px solid rgba(248,113,113,0.25); }
-.qa-warn  { background: rgba(245,158,11,0.12);  color: var(--gold);  border: 1px solid rgba(245,158,11,0.25); }
-.qa-muted { background: rgba(100,116,139,0.12); color: var(--muted); border: 1px solid rgba(100,116,139,0.2); }
-
-/* ── 杂项 ── */
-.scroll-box     { max-height: 380px; overflow: auto; }
-.hint-line      { font-size: 0.72rem; color: var(--muted); padding: 8px 14px; border-bottom: 1px solid var(--border); line-height: 1.5; }
-.empty-state    { padding: 28px; text-align: center; color: var(--muted); font-size: 0.82rem; }
-.section-pad    { padding: 16px; }
-.reason-tag     { font-size: 0.65rem; background: rgba(245,158,11,0.15); color: var(--gold); padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
-
-/* 折叠面板 */
-details.section-card > summary { list-style: none; cursor: pointer; outline: none; }
-details.section-card > summary::-webkit-details-marker { display: none; }
-"""
-
-_SCRIPT = """
-// 导航高亮
-(function() {
-    var sections = document.querySelectorAll('[data-section]');
-    var navItems = document.querySelectorAll('.nav-item[href]');
-    function onScroll() {
-        var scrollY = window.scrollY + 80;
-        var current = '';
-        sections.forEach(function(s) {
-            if (s.offsetTop <= scrollY) current = s.dataset.section;
-        });
-        navItems.forEach(function(n) {
-            n.classList.toggle('active', n.getAttribute('href') === '#' + current);
-        });
-    }
-    window.addEventListener('scroll', onScroll);
-    onScroll();
-})();
-"""
-
-# ──────────────────────────────────────────────────────────────────────────────
 # 公开接口
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 def generate_web_report(engine, df, stats, result_dir):
-    # 构建各个 HTML 片段
+    # 构建各个 HTML 碎片
     kpi_html = _build_kpi_strip(stats)
     qa_html = _build_qa_summary(engine)
     mapping_html = _build_mapping_table(engine)
@@ -807,109 +600,36 @@ def generate_web_report(engine, df, stats, result_dir):
     rollover_html = _build_rollover_audit(engine)
     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CTA 回测报告</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+SC:wght@400;600&display=swap" rel="stylesheet">
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <style>{_STYLE}</style>
-</head>
-<body>
+    # 获取当前目录下的 templates 路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    tpl_dir = os.path.join(current_dir, "templates")
 
-<nav class="sidebar">
-    <div class="sidebar-logo">
-        <div class="title">CTA REPORT</div>
-        <div class="sub">V1.2.1 · PHASE 1</div>
-    </div>
-    <a class="nav-item active" href="#qa"><span class="nav-icon">🛡</span>QA 审计</a>
-    <a class="nav-item" href="#mapping"><span class="nav-icon">📐</span>K 线对账</a>
-    <a class="nav-item" href="#chart"><span class="nav-icon">📈</span>收益图表</a>
-    <a class="nav-item" href="#daily"><span class="nav-icon">📅</span>日度明细</a>
-    <a class="nav-item" href="#rollover"><span class="nav-icon">🔄</span>换月审计</a>
-    <a class="nav-item" href="#orders"><span class="nav-icon">📋</span>订单记录</a>
-    <a class="nav-item" href="#trades"><span class="nav-icon">✅</span>成交记录</a>
-</nav>
+    # 读取前端资产文件
+    with open(os.path.join(tpl_dir, "style.css"), "r", encoding="utf-8") as f:
+        style_content = f.read()
+    with open(os.path.join(tpl_dir, "script.js"), "r", encoding="utf-8") as f:
+        script_content = f.read()
+    with open(os.path.join(tpl_dir, "report_template.html"), "r", encoding="utf-8") as f:
+        html_template = f.read()
 
-<div class="main">
-    <div class="page-header">
-        <h1>📊 CTA 回测验真报告</h1>
-        <span class="header-badge">PHASE 1</span>
-        <span class="header-ts">{ts_str}</span>
-    </div>
+    # 安全地进行占位符替换 (不使用 f-string 或 format 以防花括号冲突)
+    html_output = html_template.replace("{{ STYLE_CONTENT }}", style_content) \
+                               .replace("{{ SCRIPT_CONTENT }}", script_content) \
+                               .replace("{{ TIMESTAMP }}", ts_str) \
+                               .replace("{{ KPI_STRIP }}", kpi_html) \
+                               .replace("{{ QA_HTML }}", qa_html) \
+                               .replace("{{ MAPPING_HTML }}", mapping_html) \
+                               .replace("{{ CHART_HTML }}", chart_html) \
+                               .replace("{{ DAILY_HTML }}", daily_html) \
+                               .replace("{{ ROLLOVER_HTML }}", rollover_html) \
+                               .replace("{{ ORDERS_HTML }}", orders_html) \
+                               .replace("{{ TRADES_HTML }}", trades_html) \
+                               .replace("{{ STATS_HTML }}", stats_html)
 
-    {kpi_html}
-
-    <div class="layout-grid">
-        <div class="layout-left">
-
-            <div data-section="qa">{qa_html}</div>
-
-            <div data-section="mapping">{mapping_html}</div>
-
-            <div class="section-card" data-section="chart">
-                <div class="section-header">
-                    <span class="section-icon">📈</span>
-                    <span>收益图表</span>
-                    <span class="section-sub">净值 / 回撤 / 盈亏</span>
-                </div>
-                <div class="section-pad">{chart_html}</div>
-            </div>
-
-            <div class="section-card" data-section="daily">
-                <div class="section-header">
-                    <span class="section-icon">📅</span>
-                    <span>日度结算明细</span>
-                    <span class="section-sub">倒序排列</span>
-                </div>
-                <div>{daily_html}</div>
-            </div>
-
-            <div class="section-card" data-section="rollover">
-                <div class="section-header">
-                    <span class="section-icon">🔄</span>
-                    <span>换月事件审计</span>
-                    <span class="section-sub">摩擦成本账本</span>
-                </div>
-                <div class="section-pad">{rollover_html}</div>
-            </div>
-
-            <div class="section-card" data-section="orders">
-                <div class="section-header">
-                    <span class="section-icon">📋</span>
-                    <span>订单生命周期</span>
-                </div>
-                <div>{orders_html}</div>
-            </div>
-
-            <div class="section-card" data-section="trades">
-                <div class="section-header">
-                    <span class="section-icon">✅</span>
-                    <span>物理成交记录</span>
-                </div>
-                <div>{trades_html}</div>
-            </div>
-
-        </div>
-
-        <div class="layout-right">
-            <div class="stats-panel">
-                <div class="stats-panel-header">📊 绩效指标</div>
-                {stats_html}
-            </div>
-        </div>
-    </div>
-</div>
-
-<script>{_SCRIPT}</script>
-</body>
-</html>"""
-
+    # 写入最终结果
     report_file = os.path.join(result_dir, f"report_{datetime.now().strftime('%H%M%S')}.html")
     with open(report_file, "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(html_output)
+
     webbrowser.open(f"file://{os.path.abspath(report_file)}")
     print(f"✅ 报告已生成: {report_file}")

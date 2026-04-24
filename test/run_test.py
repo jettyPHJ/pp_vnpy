@@ -92,7 +92,6 @@ def run_main() -> None:
     if getattr(engine, "data_load_failed", False):
         error_msg = getattr(engine, 'data_load_error', '未知错误')
         print(f"❌ 数据加载失败: {error_msg}。回测已被中止！")
-        import sys
         sys.exit(1)
 
     engine.run_backtesting()
@@ -101,15 +100,14 @@ def run_main() -> None:
     if getattr(engine, "backtest_failed", False):
         error_msg = getattr(engine, 'backtest_error', '未知错误')
         print(f"❌ 回测执行过程中发生异常: {error_msg}。拒绝生成残缺报表！")
-        import sys
         sys.exit(1)
 
     # 6. 计算结果并生成报告
     df = engine.calculate_result()
     stats = engine.calculate_statistics()
 
-    # 报告输出目录：保持原来的 result 文件夹
-    result_dir = os.path.join(project_root, "_test_v1", "result")
+    # 报告输出目录：相对于本脚本所在的 test/ 文件夹
+    result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")
     os.makedirs(result_dir, exist_ok=True)
 
     generate_web_report(engine, df, stats, result_dir)
