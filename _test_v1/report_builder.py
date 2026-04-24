@@ -1,11 +1,11 @@
 """
 report_builder.py
 ─────────────────────────────────────────────────────────────────────────────
-V1 回测报告渲染器（从 run_test.py 拆分）
+V1 回测报告渲染器
 
 职责：
   - 接收 BacktestingEngine 实例 + DataFrame + stats 字典
-  - 构造全部 HTML 片段（QA 看板、图表 Tab、对账表、订单/成交表）
+  - 构造全部 HTML 片段（QA 看板、图表、对账表、订单/成交表）
   - 写入 HTML 文件并在浏览器中打开
 
 调用方：
@@ -51,17 +51,9 @@ def _fmt_stat(key, val):
     PCT_KEYS = {"max_ddpercent", "total_return", "annual_return", "daily_return", "return_std"}
     RATIO_KEYS = {"sharpe_ratio", "ewm_sharpe", "return_drawdown_ratio", "rgr_ratio"}
     MONEY_KEYS = {
-        "capital",
-        "end_balance",
-        "max_drawdown",
-        "total_net_pnl",
-        "daily_net_pnl",
-        "total_commission",
-        "daily_commission",
-        "total_slippage",
-        "daily_slippage",
-        "total_turnover",
-        "daily_turnover",
+        "capital", "end_balance", "max_drawdown", "total_net_pnl", "daily_net_pnl", "total_commission", "daily_commission",
+        "total_slippage", "daily_slippage", "total_turnover", "daily_turnover", "total_rollover_commission",
+        "total_rollover_slippage", "all_in_commission", "all_in_slippage"
     }
     try:
         f = float(val)
@@ -75,12 +67,11 @@ def _fmt_stat(key, val):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 各 HTML 片段构建函数
+# HTML 片段构建
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 def _build_qa_summary(engine) -> str:
-    """构建 QA 审计看板 HTML。"""
     from vnpy.trader.constant import Status as VnpyStatus
 
     on_init_blocked = sum(1 for o in getattr(engine, "warmup_blocked_orders", []) if o.get("phase") == "on_init")
@@ -112,43 +103,143 @@ def _build_qa_summary(engine) -> str:
                 missing_dts.append(rdt)
 
     dl_failed = getattr(engine, "data_load_failed", False)
-    dl_status_html = (f"<span style='color:var(--red);font-weight:bold'>FAIL ({getattr(engine,'data_load_error','')})</span>"
-                      if dl_failed else "<span style='color:var(--green);font-weight:bold'>PASS</span>")
 
-    def _cell(val, pass_val=0, warn=False):
+    def _badge(val, pass_val=0, warn=False):
         ok = (val == pass_val)
-        color = "var(--green)" if ok else ("var(--gold)" if warn else "var(--red)")
-        return f"<td style='color:{color};font-weight:bold'>{val}</td>"
+        if ok:
+            return f"<span class='qa-badge qa-pass'>{val}</span>"
+        elif warn:
+            return f"<span class='qa-badge qa-warn'>{val}</span>"
+        else:
+            return f"<span class='qa-badge qa-fail'>{val}</span>"
 
-    rows = f"""
-        <tr><td>基础数据加载 (Data Load)</td><td>{dl_status_html}</td><td>PASS 为通过</td></tr>
-        <tr><td>初始化非法发单 (on_init Blocked)</td>{_cell(on_init_blocked)}<td>0 为 PASS</td></tr>
-        <tr><td>启动期拦截 (on_start Blocked)</td>{_cell(on_start_blocked, warn=True)}<td>仅作警告参考</td></tr>
-        <tr><td>回测开始前成交 (Trades Before Start)</td>{_cell(trades_before_start)}<td>0 为 PASS</td></tr>
-        <tr><td>周期错配预警 (Interval Mismatch)</td>{_cell(mismatch_count, warn=True)}<td>大于0提示指标可能失真</td></tr>
-        <tr><td>无原因拒单 (Reject Missing Reason)</td>{_cell(len(rejected_missing))}<td>0 为 PASS</td></tr>
-        <tr><td>换月崩溃/失败 (Rollover Failed)</td>{_cell(rollover_failed)}<td>0 为 PASS</td></tr>
-        <tr><td>换月缺失K线 (Missing Rollover DTs)</td>{_cell(len(missing_dts))}<td>0 为 PASS（节假日可能非零）</td></tr>
-        <tr><td>非交易态跳过换月 (Skipped Rollovers)</td><td style='color:var(--muted)'>{skipped_rollover}</td><td>仅作参考（属正常机制）</td></tr>
-        <tr><td>无原因撤单 (Cancel Missing Reason)</td>{_cell(len(cancelled_missing))}<td>0 为 PASS</td></tr>
-    """
+    dl_badge = ("<span class='qa-badge qa-fail'>FAIL</span>" if dl_failed else "<span class='qa-badge qa-pass'>PASS</span>")
+
+    items = [
+        ("基础数据加载", "Data Load", dl_badge, "PASS 为通过"),
+        ("初始化非法发单", "on_init Blocked", _badge(on_init_blocked), "0 为 PASS"),
+        ("启动期拦截", "on_start Blocked", _badge(on_start_blocked, warn=True), "仅作参考"),
+        ("回测前成交", "Trades Before Start", _badge(trades_before_start), "0 为 PASS"),
+        ("周期错配预警", "Interval Mismatch", _badge(mismatch_count, warn=True), "大于0提示失真"),
+        ("无原因拒单", "Reject Missing Reason", _badge(len(rejected_missing)), "0 为 PASS"),
+        ("换月崩溃", "Rollover Failed", _badge(rollover_failed), "0 为 PASS"),
+        ("换月缺失K线", "Missing Rollover DTs", _badge(len(missing_dts)), "0 为 PASS"),
+        ("非交易态跳过换月", "Skipped Rollovers", f"<span class='qa-badge qa-muted'>{skipped_rollover}</span>", "仅作参考"),
+        ("无原因撤单", "Cancel Missing Reason", _badge(len(cancelled_missing)), "0 为 PASS"),
+    ]
+
+    rows_html = ""
+    for zh, en, badge, criterion in items:
+        rows_html += f"""
+        <tr>
+            <td><span class='qa-label-zh'>{zh}</span><span class='qa-label-en'>{en}</span></td>
+            <td style='text-align:center'>{badge}</td>
+            <td class='qa-criterion'>{criterion}</td>
+        </tr>"""
 
     return f"""
-    <div class="card">
-        <div class="card-header">🛡️ V1.2 引擎核心 QA 审计看板</div>
-        <div class="card-body">
-            <table class="data-table w-100 center-table">
-                <thead><tr><th>检查项</th><th style="text-align:center">实际结果</th><th style="text-align:center">判定标准</th></tr></thead>
-                <tbody>{rows}</tbody>
-            </table>
+    <div class="section-card">
+        <div class="section-header">
+            <span class="section-icon">🛡</span>
+            <span>引擎 QA 审计</span>
+            <span class="section-sub">Engine Core QA</span>
         </div>
-    </div>
-    """
+        <table class="base-table qa-table">
+            <thead><tr><th>检查项</th><th>结果</th><th>标准</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>"""
 
 
-def _build_chart_tabs(engine, df) -> str:
+def _build_kpi_strip(stats: dict) -> str:
+    """顶部 KPI 横条：最重要的 5 个指标一目了然。"""
+
+    def _kpi(label, key, positive_is_good=True):
+        raw = stats.get(key)
+        val = _fmt_stat(key, raw) if raw is not None else "—"
+        try:
+            f = float(raw)
+            if positive_is_good:
+                color_cls = "kpi-pos" if f >= 0 else "kpi-neg"
+            else:
+                color_cls = "kpi-neg" if f < 0 else "kpi-pos"
+        except (TypeError, ValueError):
+            color_cls = ""
+        return f"""
+        <div class="kpi-cell">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value {color_cls}">{val}</div>
+        </div>"""
+
+    return f"""
+    <div class="kpi-strip">
+        {_kpi("总收益率", "total_return")}
+        {_kpi("年化收益率", "annual_return")}
+        {_kpi("最大回撤", "max_ddpercent", positive_is_good=False)}
+        {_kpi("夏普比率", "sharpe_ratio")}
+        {_kpi("期末资金", "end_balance")}
+    </div>"""
+
+
+def _build_stats_panel(stats: dict) -> str:
+    """右侧绩效详情面板，分组展示。"""
+    GROUPS = [
+        ("盈亏表现", [
+            ("总收益率", "total_return"),
+            ("年化收益率", "annual_return"),
+            ("总净盈亏", "total_net_pnl"),
+            ("日均盈亏", "daily_net_pnl"),
+            ("期末资金", "end_balance"),
+        ]),
+        ("风险指标", [
+            ("最大回撤", "max_drawdown"),
+            ("回撤百分比", "max_ddpercent"),
+            ("最大回撤期(交易日)", "max_drawdown_duration"),
+            ("夏普比率", "sharpe_ratio"),
+            ("EWM Sharpe", "ewm_sharpe"),
+            ("收益回撤比", "return_drawdown_ratio"),
+            ("RGR Ratio", "rgr_ratio"),
+        ]),
+        ("成本摩擦 All-in", [
+            ("策略成交笔数", "total_trade_count"),
+            ("换月次数", "rollover_count"),
+            ("策略手续费", "total_commission"),
+            ("换月手续费", "total_rollover_commission"),
+            ("综合手续费", "all_in_commission"),
+            ("策略滑点", "total_slippage"),
+            ("换月滑点", "total_rollover_slippage"),
+            ("综合滑点", "all_in_slippage"),
+        ]),
+        ("统计周期", [
+            ("开始日期", "start_date"),
+            ("结束日期", "end_date"),
+            ("总交易日", "total_days"),
+            ("起始资金", "capital"),
+        ]),
+    ]
+
+    HIGHLIGHT = {"all_in_commission", "all_in_slippage", "rollover_count"}
+
+    html = []
+    for group_name, keys in GROUPS:
+        html.append(f"<div class='stat-group-label'>{group_name}</div>")
+        for label, k in keys:
+            if k not in stats:
+                continue
+            val = _fmt_stat(k, stats[k])
+            hl = " stat-highlight" if k in HIGHLIGHT else ""
+            html.append(f"""
+            <div class="stat-row{hl}">
+                <span class="stat-key">{label}</span>
+                <span class="stat-val">{val}</span>
+            </div>""")
+
+    return "\n".join(html)
+
+
+def _build_chart(engine, df) -> str:
     if df is None or df.empty:
-        return "<div class='card'>暂无图表数据</div>"
+        return "<div class='empty-state'>暂无图表数据</div>"
 
     plot_df = df.copy()
     capital = engine.capital
@@ -167,117 +258,86 @@ def _build_chart_tabs(engine, df) -> str:
     net_pnl = plot_df["net_pnl"].astype(float).tolist()
     cum_pnl = plot_df["cum_pnl"].astype(float).tolist()
 
-    # 稀疏采样 X 轴刻度，全程只显示约 12 个日期，消除密集重叠
-    n_ticks = 12
-    step = max(1, len(x) // n_ticks)
-    sparse_tickvals = x[::step]
-    sparse_ticktexts = sparse_tickvals
+    step = max(1, len(x) // 10)
+    sparse_x = x[::step]
 
     fig = make_subplots(
         rows=4,
         cols=1,
-        subplot_titles=["单位净值 (Net Value)", "回撤百分比 (Drawdown %)", "每日净盈亏 (Daily Pnl)", "累计净盈亏 (Cumulative Pnl)"],
-        vertical_spacing=0.12)  # 加大子图间距，防止标题与日期重叠
-
-    fig.add_trace(go.Scatter(x=x, y=net_value, mode="lines", name="单位净值", line=dict(color="#3b82f6")), row=1, col=1)
-
+        subplot_titles=["单位净值", "回撤 %", "每日盈亏", "累计盈亏"],
+        vertical_spacing=0.10,
+    )
+    fig.add_trace(go.Scatter(x=x, y=net_value, mode="lines", name="净值", line=dict(color="#3b82f6", width=1.5)), row=1, col=1)
     fig.add_trace(go.Scatter(x=x,
                              y=ddpercent,
                              fill="tozeroy",
-                             mode="lines",
-                             name="回撤(%)",
-                             line=dict(color="#f87171"),
-                             fillcolor="rgba(248, 113, 113, 0.2)"),
+                             name="回撤%",
+                             line=dict(color="#f87171", width=1),
+                             fillcolor="rgba(248,113,113,0.15)"),
                   row=2,
                   col=1)
-
-    fig.add_trace(go.Bar(x=x, y=net_pnl, name="单日盈亏", marker_color="#34d399"), row=3, col=1)
-
+    fig.add_trace(go.Bar(x=x, y=net_pnl, name="日盈亏", marker_color="rgba(52,211,153,0.7)"), row=3, col=1)
     fig.add_trace(go.Scatter(x=x,
                              y=cum_pnl,
                              fill="tozeroy",
-                             mode="lines",
                              name="累计盈亏",
-                             line=dict(color="#22d3ee"),
-                             fillcolor="rgba(34, 211, 238, 0.1)"),
+                             line=dict(color="#22d3ee", width=1.5),
+                             fillcolor="rgba(34,211,238,0.08)"),
                   row=4,
                   col=1)
 
-    # 统一设置所有子图 X 轴为稀疏刻度 + 斜体排列
-    fig.update_xaxes(
-        type="category",
-        tickmode="array",
-        tickvals=sparse_tickvals,
-        ticktext=sparse_ticktexts,
-        tickangle=-35,
-    )
-
+    fig.update_xaxes(type="category", tickmode="array", tickvals=sparse_x, ticktext=sparse_x, tickangle=-30)
     fig.update_layout(
-        height=1100,
+        height=1000,
         template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         showlegend=False,
-        margin=dict(l=50, r=50, t=40, b=60)  # ✅ 修复4：减小顶部 margin，底部留足斜体日期空间
+        margin=dict(l=55, r=20, t=36, b=50),
+        font=dict(family="'IBM Plex Mono', monospace", size=11, color="#94a3b8"),
     )
+    for i in range(1, 5):
+        fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)", row=i, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)", row=i, col=1)
 
     chart_json = pio.to_json(fig, engine="json")
-
-    # 用 <details> 实现原生折叠，默认展开，点击标题可收起
     return f"""
-    <details class="card" open>
-        <summary class="card-header" style="cursor:pointer; user-select:none; list-style:none; display:flex; align-items:center; gap:8px;">
-            <span style="color:var(--accent); font-size:0.85rem;">▼</span>
-            📈 核心指标可视化（点击收起/展开）
-        </summary>
-        <div class="card-body">
-            <div id="main_chart" style="width:100%; height:1100px;"></div>
-            <script>
-                var chartData = {chart_json};
-                Plotly.newPlot('main_chart', chartData.data, chartData.layout, {{responsive: true}});
-                document.querySelector('details.card').addEventListener('toggle', function(e) {{
-                    if (e.target.open) {{
-                        setTimeout(function() {{ Plotly.relayout('main_chart', {{}}); }}, 50);
-                    }}
-                }});
-            </script>
-        </div>
-    </details>"""
+    <div id="main_chart" style="width:100%;height:1000px;"></div>
+    <script>
+        (function(){{
+            var d = {chart_json};
+            Plotly.newPlot('main_chart', d.data, d.layout, {{responsive:true, displayModeBar:false}});
+        }})();
+    </script>"""
 
 
 def _build_mapping_table(engine) -> str:
-    """构建连续合约 vs 物理合约 K 线对账表。"""
     from vnpy.trader.constant import Interval as VnpyInterval
 
-    offset_n = 2
     bar_route_map = getattr(engine, "bar_route_map", {})
     physical_bars_map = getattr(engine, "physical_bars", {})
     history_data_ref = getattr(engine, "history_data", [])
     rollover_logs = getattr(engine, "rollover_logs", [])
-    rollover_skip_logs = getattr(engine, "rollover_skip_logs", [])
 
-    raw_rollover_dts_2 = [
+    raw_rollover_dts = [
         log.get("datetime") for log in rollover_logs if log.get("datetime") and log.get("status") not in ("FAILED", )
     ]
-    rollover_cost_dts = {_norm_dt(dt) for dt in raw_rollover_dts_2}
+    rollover_cost_dts = {_norm_dt(dt) for dt in raw_rollover_dts}
 
-    route_change_dts_list = []
+    route_change_dts = []
     prev_sym = None
     for bar in history_data_ref:
         dt = _norm_dt(bar.datetime)
         sym = bar_route_map.get(dt)
         if sym and prev_sym and sym != prev_sym:
-            route_change_dts_list.append(dt)
+            route_change_dts.append(dt)
         if sym:
             prev_sym = sym
-    route_change_dts_set = set(route_change_dts_list)
+    route_change_set = set(route_change_dts)
 
-    audit_dts = rollover_cost_dts | route_change_dts_set
-
+    audit_dts = rollover_cost_dts | route_change_set
     if not (bar_route_map and physical_bars_map and audit_dts and history_data_ref):
-        return """
-        <div class="card">
-            <div class="card-header">📐 连续合约 vs 物理合约 K线对账</div>
-            <div class="card-body"><div class="empty-state">未生成对账表：无换月事件，或映射/物理K线数据为空。</div></div>
-        </div>"""
+        return "<div class='empty-state'>未生成对账表：无换月事件，或映射/物理K线数据为空。</div>"
 
     try:
         is_daily = (engine.interval == VnpyInterval.DAILY)
@@ -285,16 +345,12 @@ def _build_mapping_table(engine) -> str:
         is_daily = True
     offset_n = 2 if is_daily else 5
 
-    dt_to_index_map = {_norm_dt(b.datetime): i for i, b in enumerate(history_data_ref)}
+    dt_to_index = {_norm_dt(b.datetime): i for i, b in enumerate(history_data_ref)}
     target_indices = set()
-    missing_mapping_dts = []
-
     for rdt in audit_dts:
-        idx = dt_to_index_map.get(rdt)
-        if idx is None:
-            missing_mapping_dts.append(rdt)
-            continue
-        target_indices.update(range(max(0, idx - offset_n), min(len(history_data_ref), idx + offset_n + 1)))
+        idx = dt_to_index.get(rdt)
+        if idx is not None:
+            target_indices.update(range(max(0, idx - offset_n), min(len(history_data_ref), idx + offset_n + 1)))
 
     rows_html = []
     for idx in sorted(target_indices):
@@ -307,100 +363,86 @@ def _build_mapping_table(engine) -> str:
             po, ph, pl, pc = (f"{phys_bar.open_price:.2f}", f"{phys_bar.high_price:.2f}", f"{phys_bar.low_price:.2f}",
                               f"{phys_bar.close_price:.2f}")
             diff_val = bar.close_price - phys_bar.close_price
-            close_diff = f"<span style='color:var(--muted)'>{diff_val:+.2f}</span>"
+            close_diff = f"<span class='diff-val'>{diff_val:+.2f}</span>"
         else:
-            po = ph = pl = pc = f"<span style='color:var(--red)'>N/A</span>"
-            close_diff = f"<span style='color:var(--red)'>N/A</span>"
+            po = ph = pl = pc = "<span class='val-na'>N/A</span>"
+            close_diff = "<span class='val-na'>N/A</span>"
 
         is_cost = dt in rollover_cost_dts
-        is_route = dt in route_change_dts_set
-        if is_cost and is_route: flag, rc = "🔄 BOTH", " class='rollover-row'"
-        elif is_cost: flag, rc = "💰 ROLLOVER", " class='rollover-row'"
-        elif is_route: flag, rc = "🧭 ROUTE", " style='background:rgba(59,130,246,0.08)'"
-        else: flag, rc = "", ""
+        is_route = dt in route_change_set
+        if is_cost and is_route: flag, row_cls = "🔄 BOTH", "row-both"
+        elif is_cost: flag, row_cls = "💰 ROLLOVER", "row-rollover"
+        elif is_route: flag, row_cls = "🧭 ROUTE", "row-route"
+        else: flag, row_cls = "", ""
 
         dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "N/A"
-        rows_html.append(f"""<tr{rc}>
+        rows_html.append(f"""<tr class='{row_cls}'>
             <td class='mono'>{dt_str}</td>
-            <td class='mono' style='color:var(--accent2)'>{mapped_sym}</td>
+            <td class='mono sym-cell'>{mapped_sym}</td>
             <td class='mono'>{bar.open_price:.2f}</td><td class='mono'>{bar.high_price:.2f}</td>
             <td class='mono'>{bar.low_price:.2f}</td><td class='mono'>{bar.close_price:.2f}</td>
             <td class='mono'>{po}</td><td class='mono'>{ph}</td>
             <td class='mono'>{pl}</td><td class='mono'>{pc}</td>
             <td class='mono'>{close_diff}</td>
-            <td style='font-weight:bold'>{flag}</td>
+            <td class='event-flag'>{flag}</td>
         </tr>""")
 
-    warn_html = ""
-    if missing_mapping_dts:
-        warn_html = f"<div class='hint-text' style='color:var(--gold)'>⚠️ 有 {len(missing_mapping_dts)} 个切换点无法在 history_data 中定位（可能为节假日）</div>"
-
     return f"""
-    <div class="card">
-        <div class="card-header">📐 连续合约 vs 物理合约 K线对账（切换点 ±{offset_n} 根）</div>
-        <div class="card-body">
-            {warn_html}
-            <p class="hint-text">close_diff = 连续复权收盘 − 物理原始收盘，复权后差值非零属正常。
-            🔄 BOTH = 映射切换且有换月摩擦；💰 ROLLOVER = 有换月摩擦；🧭 ROUTE = 仅映射切换。</p>
-            <div class="scroll-box">
-                <table class="data-table w-100">
-                    <thead><tr>
-                        <th>时间</th><th>映射物理合约</th>
-                        <th>Cont O</th><th>Cont H</th><th>Cont L</th><th>Cont C</th>
-                        <th>Phys O</th><th>Phys H</th><th>Phys L</th><th>Phys C</th>
-                        <th>Close Diff</th><th>事件类型</th>
-                    </tr></thead>
-                    <tbody>{"".join(rows_html)}</tbody>
-                </table>
-            </div>
+    <div class="section-card">
+        <div class="section-header">
+            <span class="section-icon">📐</span>
+            <span>连续合约 K 线对账</span>
+            <span class="section-sub">切换点 ±{offset_n} 根</span>
+        </div>
+        <p class="hint-line">close_diff = 连续复权收盘 − 物理原始收盘，复权后差值非零属正常。
+        🔄 BOTH = 映射切换且有换月摩擦；💰 ROLLOVER = 有换月摩擦；🧭 ROUTE = 仅映射切换。</p>
+        <div class="scroll-box">
+            <table class="base-table mapping-table">
+                <thead><tr>
+                    <th>时间</th><th>物理合约</th>
+                    <th>连续O</th><th>连续H</th><th>连续L</th><th>连续C</th>
+                    <th>物理O</th><th>物理H</th><th>物理L</th><th>物理C</th>
+                    <th>Close Diff</th><th>事件</th>
+                </tr></thead>
+                <tbody>{"".join(rows_html)}</tbody>
+            </table>
         </div>
     </div>"""
 
 
 def _build_rollover_audit(engine) -> str:
-    """构建引擎级换月事件审计表。"""
     rollover_logs = engine.get_rollover_logs()
     if not rollover_logs:
-        return "<div class='alert-ok-box'>✅ 本次回测未检测到换月摩擦扣费。</div>"
+        return "<div class='empty-state'>本次回测未检测到换月摩擦。</div>"
 
-    headers = "<th>换月时间</th><th>平旧合约</th><th>开新合约</th><th>方向</th><th>手数</th><th>结算基准价</th><th>双边手续费</th><th>双边滑点</th><th>摩擦总损耗</th>"
     rows = []
     for log in rollover_logs:
-        dt_str = log["datetime"].strftime("%Y-%m-%d %H:%M")
-        rows.append(f"""<tr class='rollover-row'>
-            <td>{dt_str}</td>
-            <td class='mono' style='color:var(--red)'>{log['old_symbol']}</td>
-            <td class='mono' style='color:var(--green)'>{log['new_symbol']}</td>
-            <td>{log['direction']}</td><td>{log['volume']}</td>
+        if log.get("status") == "FAILED":
+            continue
+        dt_str = log["datetime"].strftime("%Y-%m-%d")
+        rows.append(f"""<tr>
+            <td class='mono'>{dt_str}</td>
+            <td class='mono sym-old'>{log['old_symbol']}</td>
+            <td class='mono sym-new'>{log['new_symbol']}</td>
+            <td>{log['direction']}</td>
+            <td class='mono'>{log['volume']}</td>
             <td class='mono'>{log['ref_price']:.2f}</td>
             <td class='mono'>{log['commission']:.2f}</td>
             <td class='mono'>{log['slippage']:.2f}</td>
-            <td class='stat-val' style='color:var(--gold)'>{log['rollover_pnl']:.2f}</td>
+            <td class='mono pnl-neg'>{log['rollover_pnl']:.2f}</td>
         </tr>""")
 
     return f"""
-    <p class="hint-text">🟡 数据来源：引擎底层换月事件账本 (Rollover Logs)</p>
-    <div class="scroll-box">
-        <table class="data-table w-100">
-            <thead><tr>{headers}</tr></thead>
-            <tbody>{"".join(rows)}</tbody>
-        </table>
-    </div>"""
-
-
-def _build_stats_table(stats: dict) -> str:
-    """构建绩效指标表格。"""
-    rows = "".join(f"<tr><td class='stat-key'>{k}</td><td class='stat-val'>{_fmt_stat(k,v)}</td></tr>"
-                   for k, v in stats.items())
-    return f"""
-    <table class="data-table w-100">
-        <thead><tr><th>指标</th><th style="text-align:right">数值</th></tr></thead>
-        <tbody>{rows}</tbody>
+    <table class="base-table">
+        <thead><tr>
+            <th>日期</th><th>旧合约</th><th>新合约</th><th>方向</th>
+            <th>手数</th><th>基准价</th><th>手续费</th><th>滑点</th><th>摩擦损耗</th>
+        </tr></thead>
+        <tbody>{"".join(rows)}</tbody>
     </table>"""
 
 
 def _build_orders_table(engine) -> str:
-    """构建订单生命周期表格。"""
     all_orders = []
     for o in engine.get_all_orders():
         sym = getattr(o, "vt_symbol", o.symbol)
@@ -429,33 +471,29 @@ def _build_orders_table(engine) -> str:
         })
 
     all_orders.sort(key=lambda x: _normalize_dt(x["dt"]))
-
     if not all_orders:
         return "<div class='empty-state'>无委托记录</div>"
 
     rows = []
     for o in all_orders:
         is_cancelled = "撤销" in o["status"] or "CANCEL" in o["status"].upper()
-        rc = " class='cancel-row'" if is_cancelled else ""
-        badge = (f" <span class='reason-badge'>{o['reason']}</span>" if o["reason"] else "")
+        rc = " class='row-cancelled'" if is_cancelled else ""
+        badge = (f"<span class='reason-tag'>{o['reason']}</span>" if o["reason"] else "")
         dt_str = _normalize_dt(o["dt"]).strftime("%Y-%m-%d %H:%M")
-        rows.append(f"<tr{rc}><td>{dt_str}</td><td class='mono'>{o['sym']}</td>"
+        rows.append(f"<tr{rc}><td class='mono'>{dt_str}</td><td class='mono sym-cell'>{o['sym']}</td>"
                     f"<td>{o['type']}</td><td>{o['dir']}</td><td>{o['off']}</td>"
                     f"<td class='mono'>{o['price']:.2f}</td><td>{o['vol']}</td>"
                     f"<td>{o['status']}{badge}</td></tr>")
 
     return f"""<div class="scroll-box">
-        <table class="data-table w-100">
-            <thead><tr>
-                <th>发单时间</th><th>合约</th><th>类型</th><th>方向</th>
-                <th>动作</th><th>价格</th><th>数量</th><th>状态</th>
-            </tr></thead>
+        <table class="base-table">
+            <thead><tr><th>发单时间</th><th>合约</th><th>类型</th><th>方向</th>
+            <th>动作</th><th>价格</th><th>数量</th><th>状态</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
         </table></div>"""
 
 
 def _build_trades_table(engine) -> str:
-    """构建物理成交记录表格。"""
     trades = engine.get_all_trades()
     if not trades:
         return "<div class='empty-state'>无成交记录</div>"
@@ -463,198 +501,292 @@ def _build_trades_table(engine) -> str:
     rows = []
     for t in trades:
         sym = getattr(t, "vt_symbol", f"{t.symbol}.{t.exchange.value}")
-        rows.append(f"<tr><td>{pd.to_datetime(t.datetime).strftime('%Y-%m-%d %H:%M')}</td>"
-                    f"<td class='mono'>{sym}</td><td>{t.direction.value}</td>"
+        rows.append(f"<tr><td class='mono'>{pd.to_datetime(t.datetime).strftime('%Y-%m-%d %H:%M')}</td>"
+                    f"<td class='mono sym-cell'>{sym}</td><td>{t.direction.value}</td>"
                     f"<td>{t.offset.value}</td><td class='mono'>{t.price:.2f}</td>"
                     f"<td>{t.volume}</td></tr>")
 
     return f"""<div class="scroll-box">
-        <table class="data-table w-100">
-            <thead><tr>
-                <th>成交时间</th><th>合约</th><th>方向</th>
-                <th>动作</th><th>成交价</th><th>数量</th>
-            </tr></thead>
+        <table class="base-table">
+            <thead><tr><th>成交时间</th><th>合约</th><th>方向</th>
+            <th>动作</th><th>成交价</th><th>数量</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
         </table></div>"""
 
 
 def _build_daily_results_table(df) -> str:
-    """构建日度盈亏明细表格"""
     if df is None or df.empty:
         return "<div class='empty-state'>无日度结算数据</div>"
 
     rows = []
-    # 按照日期倒序排列，方便看最近的表现
     for dt, row in df.sort_index(ascending=False).iterrows():
-        dt_str = dt.strftime("%Y-%m-%d")
-        net_pnl_style = f"style='color: {'#34d399' if row['net_pnl'] >= 0 else '#f87171'}'"
+        pnl_cls = "pnl-pos" if row["net_pnl"] >= 0 else "pnl-neg"
         rows.append(f"<tr>"
-                    f"<td>{dt_str}</td>"
+                    f"<td class='mono'>{dt.strftime('%Y-%m-%d')}</td>"
                     f"<td class='mono'>{row['balance']:,.2f}</td>"
-                    f"<td class='mono' {net_pnl_style}>{row['net_pnl']:,.2f}</td>"
+                    f"<td class='mono {pnl_cls}'>{row['net_pnl']:,.2f}</td>"
                     f"<td class='mono'>{row['commission']:,.2f}</td>"
                     f"<td class='mono'>{row['slippage']:,.2f}</td>"
-                    f"<td class='mono'>{row['trade_count']}</td>"
+                    f"<td class='mono'>{int(row['trade_count'])}</td>"
                     f"</tr>")
 
     return f"""
-    <div class="card">
-        <div class="card-header">📅 日度结算明细 (Daily Results)</div>
-        <div class="card-body">
-            <div class="scroll-box" style="max-height: 400px;">
-                <table class="data-table w-100">
-                    <thead><tr>
-                        <th>日期</th><th>账户余额</th><th>当日净盈亏</th><th>手续费</th><th>滑点</th><th>成交数</th>
-                    </tr></thead>
-                    <tbody>{"".join(rows)}</tbody>
-                </table>
-            </div>
-        </div>
+    <div class="scroll-box" style="max-height:420px">
+        <table class="base-table">
+            <thead><tr><th>日期</th><th>账户余额</th><th>当日净盈亏</th>
+            <th>手续费</th><th>滑点</th><th>成交数</th></tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
     </div>"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CSS + JS 模板
+# CSS
 # ──────────────────────────────────────────────────────────────────────────────
 
 _STYLE = """
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-    --bg:        #0f1117;
-    --surface:   #181c27;
-    --border:    #272d3d;
-    --accent:    #3b82f6;
-    --accent2:   #22d3ee;
-    --gold:      #f59e0b;
-    --red:       #f87171;
-    --green:     #34d399;
-    --text:      #e2e8f0;
-    --muted:     #64748b;
-    --font-body: 'IBM Plex Sans SC', sans-serif;
-    --font-mono: 'IBM Plex Mono', monospace;
+    --bg:       #0b0e18;
+    --surface:  #111827;
+    --surface2: #1a2235;
+    --border:   #1e2d45;
+    --border2:  #2a3f5c;
+    --accent:   #3b82f6;
+    --accent2:  #22d3ee;
+    --gold:     #f59e0b;
+    --red:      #f87171;
+    --green:    #34d399;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --muted2:   #475569;
+    --font:     'IBM Plex Sans SC', 'PingFang SC', sans-serif;
+    --mono:     'IBM Plex Mono', 'Fira Code', monospace;
 }
+
+html { scroll-behavior: smooth; }
 
 body {
     background: var(--bg);
     color: var(--text);
-    font-family: var(--font-body);
-    font-size: 0.875rem;
+    font-family: var(--font);
+    font-size: 13px;
     line-height: 1.6;
-    padding: 24px 20px 40px;
 }
 
-/* ─── 页面标题 ─── */
-.page-header {
-    display: flex; align-items: baseline; gap: 12px;
-    margin-bottom: 24px; padding-bottom: 16px;
+/* ── 侧边导航 ── */
+.sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0;
+    width: 200px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    padding: 24px 0;
+    z-index: 100;
+    display: flex; flex-direction: column;
+}
+.sidebar-logo {
+    padding: 0 20px 20px;
     border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
 }
-.page-header h1 { font-size: 1.25rem; font-weight: 600; color: var(--text); }
-.page-header .badge {
-    font-family: var(--font-mono); font-size: 0.7rem;
-    padding: 2px 8px; border-radius: 4px;
-    background: var(--accent); color: white;
-}
-
-/* ─── 卡片 ─── */
-.card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; overflow: hidden; margin-bottom: 16px;
-}
-.card-header {
-    padding: 10px 16px; font-size: 0.8rem; font-weight: 600;
-    letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
-    border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02);
-}
-.card-body { padding: 0; }
-
-/* ─── 网格 ─── */
-.grid-2   { display: grid; grid-template-columns: 1fr 1fr;  gap: 16px; }
-.grid-8-4 { display: grid; grid-template-columns: 8fr 4fr;  gap: 16px; align-items: start; }
-@media (max-width: 1100px) { .grid-8-4, .grid-2 { grid-template-columns: 1fr; } }
-
-/* ─── 数据表格 ─── */
-.scroll-box { max-height: 380px; overflow: auto; }
-.data-table {
-    width: 100%; border-collapse: collapse; font-size: 0.82rem;
-    table-layout: auto;   /* 让各列自适应内容宽度 */
-}
-.data-table th {
-    position: sticky; top: 0; z-index: 2;
-    background: #1e2535; color: var(--muted);
-    font-weight: 600; font-size: 0.75rem; letter-spacing: 0.05em;
-    text-transform: uppercase; padding: 8px 12px;
-    white-space: nowrap; text-align: left;
-    border-bottom: 1px solid var(--border);
-}
-.data-table td {
-    padding: 7px 12px; white-space: nowrap;
-    border-bottom: 1px solid rgba(255,255,255,0.04); color: var(--text);
-}
-/* 对齐修复：center-table 让所有 th/td 居中 */
-.center-table th, .center-table td { text-align: center !important; }
-/* 但 center-table 第一列保持左对齐 */
-.center-table th:first-child, .center-table td:first-child { text-align: left !important; }
-
-.data-table tbody tr:hover td { background: rgba(59,130,246,0.07); }
-.data-table .mono   { font-family: var(--font-mono); font-size: 0.8rem; }
-.data-table .stat-key { color: var(--muted); font-size: 0.8rem; }
-.data-table .stat-val { font-family: var(--font-mono); font-size: 0.82rem; text-align: right; color: var(--accent2); }
-.w-100 { width: 100%; }
-
-/* ─── 特殊行 ─── */
-.rollover-row td { background: rgba(245,158,11,0.1) !important; color: var(--gold) !important; font-weight: 500; }
-.cancel-row   td { color: var(--red) !important; }
-
-/* ─── 提示文本 ─── */
-.hint-text {
+.sidebar-logo .title { font-size: 0.8rem; font-weight: 700; color: var(--text); letter-spacing: 0.08em; }
+.sidebar-logo .sub   { font-size: 0.65rem; color: var(--muted); margin-top: 2px; }
+.nav-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 20px;
     font-size: 0.75rem; color: var(--muted);
-    padding: 10px 14px 8px; border-bottom: 1px solid var(--border);
+    cursor: pointer; text-decoration: none;
+    transition: color 0.15s, background 0.15s;
+    border-left: 2px solid transparent;
+}
+.nav-item:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+.nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(59,130,246,0.06); }
+.nav-icon { width: 16px; text-align: center; opacity: 0.7; }
+
+/* ── 主内容区 ── */
+.main {
+    margin-left: 200px;
+    padding: 32px 32px 64px;
+    max-width: 1280px;
 }
 
-/* ─── 状态框 ─── */
-.alert-danger-box, .alert-ok-box, .empty-state {
-    padding: 24px; text-align: center; font-size: 0.85rem; color: var(--muted);
+/* ── 顶部标题栏 ── */
+.page-header {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 28px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
 }
-.alert-danger-box { color: var(--red); }
-.alert-ok-box     { color: var(--green); }
-
-/* ─── 撤单原因标签 ─── */
-.reason-badge {
-    font-size: 0.7rem; color: #856404;
-    background: #fff3cd; padding: 2px 4px; border-radius: 3px;
+.page-header h1 { font-size: 1.1rem; font-weight: 600; color: var(--text); }
+.header-badge {
+    font-family: var(--mono); font-size: 0.65rem;
+    padding: 3px 10px; border-radius: 20px;
+    background: rgba(59,130,246,0.15); color: var(--accent);
+    border: 1px solid rgba(59,130,246,0.3);
+    letter-spacing: 0.05em;
 }
+.header-ts { margin-left: auto; font-size: 0.7rem; color: var(--muted); font-family: var(--mono); }
 
-/* ─── 图表 Tab ─── */
-.chart-tabs { display: flex; }
-.chart-tab {
-    background: transparent; border: none; border-bottom: 2px solid transparent;
-    color: var(--muted); font-size: 0.78rem; font-weight: 600;
-    padding: 10px 18px; cursor: pointer; letter-spacing: 0.04em;
-    transition: color .15s, border-color .15s;
+/* ── KPI 横条 ── */
+.kpi-strip {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
 }
-.chart-tab:hover  { color: var(--text); }
-.chart-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.chart-panel      { display: none; }
-.chart-panel.active { display: block; }
+.kpi-cell {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    transition: border-color 0.15s;
+}
+.kpi-cell:hover { border-color: var(--border2); }
+.kpi-label { font-size: 0.7rem; color: var(--muted); margin-bottom: 6px; }
+.kpi-value { font-family: var(--mono); font-size: 1.1rem; font-weight: 600; color: var(--text); }
+.kpi-pos   { color: var(--green) !important; }
+.kpi-neg   { color: var(--red)   !important; }
 
-/* ─── 折叠图表 ─── */
-details.card > summary { outline: none; }
-details.card > summary span { transition: transform .2s; display: inline-block; }
-details.card:not([open]) > summary span { transform: rotate(-90deg); }
+/* ── 主布局 ── */
+.layout-grid {
+    display: grid;
+    grid-template-columns: 1fr 280px;
+    gap: 20px;
+    align-items: start;
+}
+.layout-left  { min-width: 0; }
+.layout-right { position: sticky; top: 32px; }
+
+/* ── section 区块 ── */
+.section-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 20px;
+}
+.section-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.015);
+    font-size: 0.75rem; font-weight: 600;
+    color: var(--text); letter-spacing: 0.04em;
+}
+.section-icon { font-size: 0.9rem; }
+.section-sub  { margin-left: auto; font-size: 0.68rem; color: var(--muted); font-weight: 400; }
+
+/* ── 绩效右侧面板 ── */
+.stats-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    padding: 0 0 8px;
+}
+.stats-panel-header {
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.75rem; font-weight: 600; color: var(--text);
+    letter-spacing: 0.04em;
+    background: rgba(255,255,255,0.015);
+}
+.stat-group-label {
+    font-size: 0.65rem; color: var(--muted); letter-spacing: 0.08em;
+    padding: 10px 16px 4px;
+    text-transform: uppercase;
+}
+.stat-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.stat-row:last-child { border-bottom: none; }
+.stat-row.stat-highlight { background: rgba(245,158,11,0.04); }
+.stat-key { font-size: 0.75rem; color: var(--muted); }
+.stat-val { font-family: var(--mono); font-size: 0.78rem; color: var(--accent2); }
+.stat-highlight .stat-key { color: var(--gold); }
+.stat-highlight .stat-val { color: var(--gold); }
+
+/* ── 基础表格 ── */
+.base-table {
+    width: 100%; border-collapse: collapse;
+    font-size: 0.78rem;
+}
+.base-table th {
+    position: sticky; top: 0; z-index: 2;
+    background: #131c2e; color: var(--muted);
+    font-weight: 600; font-size: 0.68rem;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 8px 12px; white-space: nowrap; text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+.base-table td {
+    padding: 6px 12px; white-space: nowrap;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    color: var(--text);
+}
+.base-table tbody tr:hover td { background: rgba(59,130,246,0.06); }
+.mono     { font-family: var(--mono); font-size: 0.76rem; }
+.sym-cell { color: var(--accent2); }
+.sym-old  { color: var(--red);     }
+.sym-new  { color: var(--green);   }
+.pnl-pos  { color: var(--green);   }
+.pnl-neg  { color: var(--red);     }
+.diff-val { color: var(--muted2);  }
+.val-na   { color: var(--red); opacity: 0.7; }
+.event-flag { font-weight: 600; }
+.row-both     td { background: rgba(245,158,11,0.07)  !important; }
+.row-rollover td { background: rgba(245,158,11,0.05)  !important; color: var(--gold) !important; }
+.row-route    td { background: rgba(59,130,246,0.05)  !important; }
+.row-cancelled td { color: var(--red) !important; opacity: 0.8; }
+
+/* ── QA 表格 ── */
+.qa-table   { width: 100%; }
+.qa-label-zh { display: block; font-size: 0.78rem; color: var(--text); }
+.qa-label-en { display: block; font-size: 0.68rem; color: var(--muted); margin-top: 1px; font-family: var(--mono); }
+.qa-criterion { font-size: 0.7rem; color: var(--muted); }
+.qa-badge {
+    display: inline-block;
+    font-family: var(--mono); font-size: 0.72rem; font-weight: 600;
+    padding: 3px 10px; border-radius: 12px;
+}
+.qa-pass  { background: rgba(52,211,153,0.12); color: var(--green); border: 1px solid rgba(52,211,153,0.25); }
+.qa-fail  { background: rgba(248,113,113,0.12); color: var(--red);   border: 1px solid rgba(248,113,113,0.25); }
+.qa-warn  { background: rgba(245,158,11,0.12);  color: var(--gold);  border: 1px solid rgba(245,158,11,0.25); }
+.qa-muted { background: rgba(100,116,139,0.12); color: var(--muted); border: 1px solid rgba(100,116,139,0.2); }
+
+/* ── 杂项 ── */
+.scroll-box     { max-height: 380px; overflow: auto; }
+.hint-line      { font-size: 0.72rem; color: var(--muted); padding: 8px 14px; border-bottom: 1px solid var(--border); line-height: 1.5; }
+.empty-state    { padding: 28px; text-align: center; color: var(--muted); font-size: 0.82rem; }
+.section-pad    { padding: 16px; }
+.reason-tag     { font-size: 0.65rem; background: rgba(245,158,11,0.15); color: var(--gold); padding: 1px 5px; border-radius: 3px; margin-left: 4px; }
+
+/* 折叠面板 */
+details.section-card > summary { list-style: none; cursor: pointer; outline: none; }
+details.section-card > summary::-webkit-details-marker { display: none; }
 """
 
 _SCRIPT = """
-function switchTab(id) {
-    document.querySelectorAll('.chart-tab').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.chart-panel').forEach(p => p.classList.remove('active'));
-    document.getElementById('tab-'   + id).classList.add('active');
-    document.getElementById('panel-' + id).classList.add('active');
-    // 触发 Plotly resize，防止首次渲染尺寸错误
-    var panels = document.querySelectorAll('#panel-' + id + ' .js-plotly-plot');
-    panels.forEach(function(el){ if(window.Plotly) Plotly.relayout(el, {}); });
-}
+// 导航高亮
+(function() {
+    var sections = document.querySelectorAll('[data-section]');
+    var navItems = document.querySelectorAll('.nav-item[href]');
+    function onScroll() {
+        var scrollY = window.scrollY + 80;
+        var current = '';
+        sections.forEach(function(s) {
+            if (s.offsetTop <= scrollY) current = s.dataset.section;
+        });
+        navItems.forEach(function(n) {
+            n.classList.toggle('active', n.getAttribute('href') === '#' + current);
+        });
+    }
+    window.addEventListener('scroll', onScroll);
+    onScroll();
+})();
 """
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -664,68 +796,120 @@ function switchTab(id) {
 
 def generate_web_report(engine, df, stats, result_dir):
     # 构建各个 HTML 片段
+    kpi_html = _build_kpi_strip(stats)
     qa_html = _build_qa_summary(engine)
     mapping_html = _build_mapping_table(engine)
-    rollover_html = _build_rollover_audit(engine)
-    chart_html = _build_chart_tabs(engine, df)
+    chart_html = _build_chart(engine, df)
     daily_html = _build_daily_results_table(df)
-    stats_html = _build_stats_table(stats)
+    stats_html = _build_stats_panel(stats)
     orders_html = _build_orders_table(engine)
     trades_html = _build_trades_table(engine)
+    rollover_html = _build_rollover_audit(engine)
+    ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # 组装 HTML
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>V1 CTA 回测报告</title>
-        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-        <style>{_STYLE}</style>
-    </head>
-    <body>
-        <div class="page-header">
-            <h1>📊 V1 CTA 回测验真报告</h1>
-            <span class="badge">PHASE 1</span>
-        </div>
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTA 回测报告</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+SC:wght@400;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>{_STYLE}</style>
+</head>
+<body>
 
-        {qa_html}
-        {mapping_html}
-        {chart_html}
-        {daily_html}
+<nav class="sidebar">
+    <div class="sidebar-logo">
+        <div class="title">CTA REPORT</div>
+        <div class="sub">V1.2.1 · PHASE 1</div>
+    </div>
+    <a class="nav-item active" href="#qa"><span class="nav-icon">🛡</span>QA 审计</a>
+    <a class="nav-item" href="#mapping"><span class="nav-icon">📐</span>K 线对账</a>
+    <a class="nav-item" href="#chart"><span class="nav-icon">📈</span>收益图表</a>
+    <a class="nav-item" href="#daily"><span class="nav-icon">📅</span>日度明细</a>
+    <a class="nav-item" href="#rollover"><span class="nav-icon">🔄</span>换月审计</a>
+    <a class="nav-item" href="#orders"><span class="nav-icon">📋</span>订单记录</a>
+    <a class="nav-item" href="#trades"><span class="nav-icon">✅</span>成交记录</a>
+</nav>
 
-        <div class="grid-8-4">
-            <div>
-                <div class="card">
-                    <div class="card-header">引擎级换月事件审计 (Rollover Logs)</div>
-                    <div class="card-body">{rollover_html}</div>
+<div class="main">
+    <div class="page-header">
+        <h1>📊 CTA 回测验真报告</h1>
+        <span class="header-badge">PHASE 1</span>
+        <span class="header-ts">{ts_str}</span>
+    </div>
+
+    {kpi_html}
+
+    <div class="layout-grid">
+        <div class="layout-left">
+
+            <div data-section="qa">{qa_html}</div>
+
+            <div data-section="mapping">{mapping_html}</div>
+
+            <div class="section-card" data-section="chart">
+                <div class="section-header">
+                    <span class="section-icon">📈</span>
+                    <span>收益图表</span>
+                    <span class="section-sub">净值 / 回撤 / 盈亏</span>
                 </div>
-                <div class="grid-2">
-                    <div class="card">
-                        <div class="card-header">订单生命周期</div>
-                        <div class="card-body">{orders_html}</div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">物理成交记录</div>
-                        <div class="card-body">{trades_html}</div>
-                    </div>
-                </div>
+                <div class="section-pad">{chart_html}</div>
             </div>
 
-            <div class="card">
-                <div class="card-header">绩效指标</div>
-                <div class="card-body">
-                    <div class="scroll-box" style="max-height:520px">{stats_html}</div>
+            <div class="section-card" data-section="daily">
+                <div class="section-header">
+                    <span class="section-icon">📅</span>
+                    <span>日度结算明细</span>
+                    <span class="section-sub">倒序排列</span>
                 </div>
+                <div>{daily_html}</div>
             </div>
+
+            <div class="section-card" data-section="rollover">
+                <div class="section-header">
+                    <span class="section-icon">🔄</span>
+                    <span>换月事件审计</span>
+                    <span class="section-sub">摩擦成本账本</span>
+                </div>
+                <div class="section-pad">{rollover_html}</div>
+            </div>
+
+            <div class="section-card" data-section="orders">
+                <div class="section-header">
+                    <span class="section-icon">📋</span>
+                    <span>订单生命周期</span>
+                </div>
+                <div>{orders_html}</div>
+            </div>
+
+            <div class="section-card" data-section="trades">
+                <div class="section-header">
+                    <span class="section-icon">✅</span>
+                    <span>物理成交记录</span>
+                </div>
+                <div>{trades_html}</div>
+            </div>
+
         </div>
 
-        <script>{_SCRIPT}</script>
-    </body>
-    </html>"""
+        <div class="layout-right">
+            <div class="stats-panel">
+                <div class="stats-panel-header">📊 绩效指标</div>
+                {stats_html}
+            </div>
+        </div>
+    </div>
+</div>
 
-    # 保存并打开报告
+<script>{_SCRIPT}</script>
+</body>
+</html>"""
+
     report_file = os.path.join(result_dir, f"report_{datetime.now().strftime('%H%M%S')}.html")
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(html)
     webbrowser.open(f"file://{os.path.abspath(report_file)}")
+    print(f"✅ 报告已生成: {report_file}")

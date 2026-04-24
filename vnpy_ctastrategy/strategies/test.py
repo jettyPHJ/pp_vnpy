@@ -1,3 +1,4 @@
+from vnpy.trader.constant import Interval
 from vnpy_ctastrategy import CtaTemplate, BarData
 
 
@@ -11,7 +12,7 @@ class TestRolloverStrategy(CtaTemplate):
 
     def on_init(self):
         self.write_log("策略初始化")
-        self.load_bar(10)
+        self.load_bar(10, interval=Interval.DAILY)
 
     def on_start(self):
         self.write_log("策略启动")

@@ -538,7 +538,7 @@ class BacktestingEngine:
 
             if isinstance(max_drawdown_end, Date):
                 max_drawdown_start = df["balance"][:max_drawdown_end].idxmax()
-                max_drawdown_duration = (max_drawdown_end - max_drawdown_start).days
+                max_drawdown_duration = len(df.loc[max_drawdown_start:max_drawdown_end])
             else:
                 max_drawdown_duration = 0
 
@@ -548,6 +548,17 @@ class BacktestingEngine:
             daily_commission = total_commission / total_days
             total_slippage = df["slippage"].sum()
             daily_slippage = total_slippage / total_days
+
+            # --- 【V1.2.1 新增】换月摩擦与综合(All-in)成本 ---
+            # get("commission", 0) 完美兼容 FAILED 日志无该字段的情况
+            total_rollover_commission = sum(log.get("commission", 0) for log in self.rollover_logs)
+            total_rollover_slippage = sum(log.get("slippage", 0) for log in self.rollover_logs)
+            all_in_commission = total_commission + total_rollover_commission
+            all_in_slippage = total_slippage + total_rollover_slippage
+
+            # 严格排除 FAILED 的失败记录
+            rollover_count = sum(1 for log in self.rollover_logs if log.get("status") != "FAILED")
+
             total_turnover = df["turnover"].sum()
             daily_turnover = total_turnover / total_days
             total_trade_count = df["trade_count"].sum()
@@ -644,6 +655,11 @@ class BacktestingEngine:
             "daily_turnover": daily_turnover,
             "total_trade_count": total_trade_count,
             "daily_trade_count": daily_trade_count,
+            "rollover_count": rollover_count,
+            "total_rollover_commission": total_rollover_commission,
+            "total_rollover_slippage": total_rollover_slippage,
+            "all_in_commission": all_in_commission,
+            "all_in_slippage": all_in_slippage,
             "total_return": total_return,
             "annual_return": annual_return,
             "daily_return": daily_return,
