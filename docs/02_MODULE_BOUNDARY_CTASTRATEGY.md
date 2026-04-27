@@ -1,24 +1,20 @@
-# vnpy_ctastrategy: 核心策略引擎内部设计
+# 🚧 CTA 策略与引擎模块边界定义 (Module Boundaries)
 
-本引擎是交易意图的发源地，重构为**基于统一流水线 (Pipeline) 的事件驱动状态机**。
+> **Notice:** 明确界定 `Strategy`、`Engine` 与 `Ops Pipeline` 之间的操作权限与数据流向，杜绝隐式耦合。
 
-## ⚠️ 策略开发者红线警告 (CRITICAL)
+## 1. 策略层边界 (Strategy)
 
-为了保证底层状态机的绝对纯洁性，策略开发者必须遵守以下铁律：
+* **可读权**：仅能读取行情数据及只读的业务状态参数。
+* **写入权**：**严格禁止**篡改底层物理持仓字典。唯一输出是发出 `SignalOrder` 表达逻辑意图。
 
-1. **绝对禁止篡改物理真相**：策略在任何情况下，绝对禁止通过局部计算修改 `self.actual_pos`。该字段仅由 `TradeData` 回调与对账服务更新。
-2. **意图写入制 (当前实现)**：策略只需（也只能）直接修改 `self.target_pos`（我要多少仓位）并调用发单逻辑。现实如何成交，策略不关心，只通过 `on_trade` 异步接收。
-3. **禁止越权访问底层字典**：绝对禁止直接访问或修改 `orderid_chain_map` 或 `chain_audit_map`。
+## 2. 引擎层边界 (Engine as Orchestrator)
 
-## 🧠 核心溯源模型
+回测引擎 (`BacktestingEngine`) 与实盘引擎 (`CtaEngine`) 必须保持“枢纽 (Hub)”的纯洁性：
 
-### 1. TraceID / SpanID 模型
+* **禁止隐式计算**：引擎捕获撮合事件后，只负责调用模型获取 `SlippageResult`。严禁引擎直接执行乘法计算总摩擦金额。
+* **静态数据无状态透传**：引擎从底层的合约数据对象（`ContractData`）中提取 `contract_multiplier`，并将其作为参数透传给执行层（算费率）与对账层（算金额），确保 Tracker 和 Model 的完全无状态性。
 
-* **`chain_id` (TraceID)**：一笔交易意图的全局唯一标识。
-* **`exec_id` (SpanID)**：代表一次“物理动作”。拆单场景下，一个 `chain_id` 会衍生多个 `exec_id`。
+## 3. 流水线与对账层边界 (Ops Pipeline & Tracker)
 
-### 2. 三仓位状态模型 (严格隔离)
-
-* `target_pos`：策略目标意图，策略专属写入。
-* `allowed_pos`：风控审批后的可执行额度，引擎维护，策略只读。
-* `actual_pos`：物理真实状态，仅由 `TradeData` 回调与对账服务更新。
+* **成本核算 (Accounting)**：接收来自引擎的 `SlippageResult`、`CommissionResult` 以及引擎透传的 `contract_multiplier`，负责将其计算出最终的财务成本（金额域）。
+* **唯一真相 (Single Source of Truth)**：维持 `chain_audit_map` 作为所有逻辑到物理链路状态的最终归档地。
