@@ -16,6 +16,8 @@ from vnpy.trader.object import HistoryRequest
 from vnpy.trader.datafeed import get_datafeed
 from vnpy.trader.database import get_database
 from vnpy.trader.constant import Exchange
+from system_validator import validate_v1_3_dod
+from vnpy_ctastrategy.strategies.v13_mock_strategy import V13MockStrategy
 
 
 def download_data(route: dict) -> None:
@@ -85,7 +87,8 @@ def run_main() -> None:
     )
 
     # 5. 执行回测
-    engine.add_strategy(strategy_class, route["parameters"])
+    # engine.add_strategy(strategy_class, route["parameters"])
+    engine.add_strategy(V13MockStrategy, {})
     engine.load_data()
 
     # 数据加载失败拦截
@@ -105,6 +108,11 @@ def run_main() -> None:
     # 6. 计算结果并生成报告
     df = engine.calculate_result()
     stats = engine.calculate_statistics()
+
+    print("\n" + "=" * 50)
+    print("⏳ 开始执行 V1.3 架构防爆与对账验证...")
+    validate_v1_3_dod(engine)
+    print("=" * 50 + "\n")
 
     # 报告输出目录：相对于本脚本所在的 test/ 文件夹
     result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")

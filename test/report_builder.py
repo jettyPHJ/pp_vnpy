@@ -70,6 +70,101 @@ def _fmt_stat(key, val):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _build_order_datetime_map(engine) -> dict:
+    """vt_orderid -> OrderData.datetime，用于让审计表的信号时间与回测订单时间对齐。"""
+    mapping = {}
+    try:
+        for order in engine.get_all_orders():
+            if getattr(order, "vt_orderid", None):
+                mapping[order.vt_orderid] = order.datetime
+    except Exception:
+        pass
+    return mapping
+
+
+def _safe_dt_str(dt, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    ts = _normalize_dt(dt)
+    return ts.strftime(fmt) if ts is not None else "N/A"
+
+
+def _build_intent_audit_table(engine) -> str:
+    """构建 V1.3 意图链路审计表。
+
+    展示顺序调整为 Chain ID -> 信号时间；普通 Pipeline 记录优先使用真实订单时间，
+    避免 SignalOrder.created_at 的机器时间与回测撮合时间不一致。
+    """
+    tracker = getattr(engine, "intent_tracker", None)
+    if not tracker:
+        return "<div class='empty-state'>暂无意图链路记录</div>"
+
+    order_dt_map = _build_order_datetime_map(engine)
+    all_records = list(tracker.chain_audit_map.values()) + tracker.chain_audit_archive
+    rows = ""
+
+    for r in all_records:
+        sig, risk = r.get("signal"), r.get("risk")
+        cid = sig.chain_id if sig else ""
+        cid_display = html.escape(cid) if cid else "N/A"
+        chain_id_attr = f'id="chain-{html.escape(cid)}"' if cid else ""
+
+        if not r.get("orders"):
+            # 风控拒单没有物理订单，使用 SignalOrder.created_at；回测里已由 send_order 注入 self.datetime。
+            time_str = _safe_dt_str(getattr(sig, "created_at", None))
+            reason = getattr(risk, "reject_reason", "RISK_REJECTED") if risk else "UNKNOWN"
+            rows += f"""<tr class="audit-row-reject" {chain_id_attr}>
+                <td class="mono chain-id-cell">{cid_display}</td>
+                <td class="mono">{time_str}</td>
+                <td>{html.escape(str(sig.direction.value if sig else 'N/A'))}/{html.escape(str(sig.offset.value if sig else 'N/A'))} {getattr(sig, 'volume', 'N/A')}@{getattr(sig, 'price', 'N/A')}</td>
+                <td class="audit-risk-reject">{html.escape(str(risk.decision.value if risk else "N/A"))}</td>
+                <td class="mono">[NO_ORDER]</td>
+                <td class="audit-status-reject">Rejected</td>
+                <td class="audit-reason">{html.escape(str(reason))}</td>
+            </tr>"""
+            continue
+
+        first_row = True
+        for ref in r.get("orders", []):
+            # 普通链路的“信号时间”按真实订单时间展示，保证和订单生命周期表一致。
+            time_str = _safe_dt_str(order_dt_map.get(ref.vt_orderid) or ref.updated_at or ref.created_at)
+            status_str = ref.status.value if ref.status else "N/A"
+            row_id_attr = f'id="chain-{html.escape(cid)}"' if first_row and cid else ""
+            first_row = False
+            order_id = html.escape(str(ref.vt_orderid)) if ref.vt_orderid else "N/A"
+            order_link = f'<a class="chain-anchor" href="#order-{order_id}">{order_id}</a>' if ref.vt_orderid else "N/A"
+            chain_html = f'<a class="chain-anchor" href="#order-{order_id}">{cid_display}</a>' if ref.vt_orderid and cid else cid_display
+
+            rows += f"""<tr class="audit-row-pass" {row_id_attr}>
+                <td class="mono chain-id-cell">{chain_html}</td>
+                <td class="mono">{time_str}</td>
+                <td>{html.escape(str(sig.direction.value if sig else 'N/A'))}/{html.escape(str(sig.offset.value if sig else 'N/A'))} {getattr(sig, 'volume', 'N/A')}@{getattr(sig, 'price', 'N/A')}</td>
+                <td class="audit-risk-pass">{html.escape(str(risk.decision.value if risk else "N/A"))}</td>
+                <td class="mono">{order_link}</td>
+                <td>{html.escape(str(status_str))}</td>
+                <td class="audit-reason">PIPELINE</td>
+            </tr>"""
+
+    for record in getattr(tracker, "exempt_trade_records", []):
+        trade = record["trade"]
+        reason = record.get("reason", "STOP_ORDER")
+        time_str = _safe_dt_str(getattr(trade, "datetime", None))
+        rows += f"""<tr class="audit-row-exempt">
+            <td class="mono chain-id-cell" style="color: #f59e0b;">[EXEMPT]</td>
+            <td class="mono">{time_str}</td>
+            <td>{html.escape(str(trade.direction.value))}/{html.escape(str(trade.offset.value))} {trade.volume}@{trade.price}</td>
+            <td class="audit-risk-exempt">N/A</td>
+            <td class="mono">{html.escape(str(trade.vt_orderid))}</td>
+            <td class="audit-status-exempt">All Traded</td>
+            <td class="audit-reason">{html.escape(str(reason))}</td>
+        </tr>"""
+
+    if not rows:
+        return "<div class='empty-state'>暂无意图链路记录</div>"
+
+    return f"""<table class='base-table audit-table audit-table-wrap'>
+        <thead><tr><th>Chain ID</th><th>信号时间</th><th>意图</th><th>风控</th><th>订单ID</th><th>状态</th><th>备注/来源</th></tr></thead>
+        <tbody>{rows}</tbody></table>"""
+
+
 def _build_qa_summary(engine) -> str:
     from vnpy.trader.constant import Status as VnpyStatus
 
@@ -260,53 +355,91 @@ def _build_chart(engine, df) -> str:
     step = max(1, len(x) // 10)
     sparse_x = x[::step]
 
-    fig = make_subplots(
-        rows=4,
-        cols=1,
-        subplot_titles=["单位净值", "回撤 %", "每日盈亏", "累计盈亏"],
-        vertical_spacing=0.10,
-    )
-    fig.add_trace(go.Scatter(x=x, y=net_value, mode="lines", name="净值", line=dict(color="#3b82f6", width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x,
-                             y=ddpercent,
-                             fill="tozeroy",
-                             name="回撤%",
-                             line=dict(color="#f87171", width=1),
-                             fillcolor="rgba(248,113,113,0.15)"),
-                  row=2,
-                  col=1)
-    fig.add_trace(go.Bar(x=x, y=net_pnl, name="日盈亏", marker_color="rgba(52,211,153,0.7)"), row=3, col=1)
-    fig.add_trace(go.Scatter(x=x,
-                             y=cum_pnl,
-                             fill="tozeroy",
-                             name="累计盈亏",
-                             line=dict(color="#22d3ee", width=1.5),
-                             fillcolor="rgba(34,211,238,0.08)"),
-                  row=4,
-                  col=1)
+    def _base_layout():
+        return dict(
+            height=320,
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+            margin=dict(l=55, r=20, t=16, b=50),
+            font=dict(family="'IBM Plex Mono', monospace", size=11, color="#94a3b8"),
+            xaxis=dict(type="category",
+                       tickmode="array",
+                       tickvals=sparse_x,
+                       ticktext=sparse_x,
+                       tickangle=-30,
+                       showgrid=True,
+                       gridcolor="rgba(255,255,255,0.05)"),
+            yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+        )
 
-    fig.update_xaxes(type="category", tickmode="array", tickvals=sparse_x, ticktext=sparse_x, tickangle=-30)
-    fig.update_layout(
-        height=1000,
-        template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        showlegend=False,
-        margin=dict(l=55, r=20, t=36, b=50),
-        font=dict(family="'IBM Plex Mono', monospace", size=11, color="#94a3b8"),
-    )
-    for i in range(1, 5):
-        fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)", row=i, col=1)
-        fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.05)", row=i, col=1)
+    fig1 = go.Figure(go.Scatter(x=x, y=net_value, mode="lines", name="净值", line=dict(color="#3b82f6", width=1.5)))
+    fig1.update_layout(**_base_layout())
 
-    chart_json = pio.to_json(fig, engine="json")
+    fig2 = go.Figure(
+        go.Scatter(x=x,
+                   y=ddpercent,
+                   fill="tozeroy",
+                   name="回撤%",
+                   line=dict(color="#f87171", width=1),
+                   fillcolor="rgba(248,113,113,0.15)"))
+    fig2.update_layout(**_base_layout())
+
+    bar_colors = ["rgba(52,211,153,0.7)" if v >= 0 else "rgba(248,113,113,0.7)" for v in net_pnl]
+    fig3 = go.Figure(go.Bar(x=x, y=net_pnl, name="日盈亏", marker_color=bar_colors))
+    fig3.update_layout(**_base_layout())
+
+    fig4 = go.Figure(
+        go.Scatter(x=x,
+                   y=cum_pnl,
+                   fill="tozeroy",
+                   name="累计盈亏",
+                   line=dict(color="#22d3ee", width=1.5),
+                   fillcolor="rgba(34,211,238,0.08)"))
+    fig4.update_layout(**_base_layout())
+
+    j1 = pio.to_json(fig1, engine="json")
+    j2 = pio.to_json(fig2, engine="json")
+    j3 = pio.to_json(fig3, engine="json")
+    j4 = pio.to_json(fig4, engine="json")
+
     return f"""
-    <div id="main_chart" style="width:100%;height:1000px;"></div>
+    <div class="chart-tabs">
+        <button class="chart-tab-btn active" data-tab="c_netval">📈 单位净值</button>
+        <button class="chart-tab-btn" data-tab="c_dd">📉 回撤 %</button>
+        <button class="chart-tab-btn" data-tab="c_daily">📊 每日盈亏</button>
+        <button class="chart-tab-btn" data-tab="c_cum">💰 累计盈亏</button>
+    </div>
+    <div id="c_netval" class="chart-tab-pane active"><div id="chart_netval" style="width:100%;height:320px;"></div></div>
+    <div id="c_dd"     class="chart-tab-pane"><div id="chart_dd" style="width:100%;height:320px;"></div></div>
+    <div id="c_daily"  class="chart-tab-pane"><div id="chart_daily" style="width:100%;height:320px;"></div></div>
+    <div id="c_cum"    class="chart-tab-pane"><div id="chart_cum" style="width:100%;height:320px;"></div></div>
     <script>
-        (function(){{
-            var d = {chart_json};
-            Plotly.newPlot('main_chart', d.data, d.layout, {{responsive:true, displayModeBar:false}});
-        }})();
+    (function(){{
+        var charts = {{
+            chart_netval: {j1},
+            chart_dd:     {j2},
+            chart_daily:  {j3},
+            chart_cum:    {j4}
+        }};
+        Plotly.newPlot('chart_netval', charts.chart_netval.data, charts.chart_netval.layout, {{responsive:true, displayModeBar:false}});
+        var rendered = {{chart_netval: true}};
+        document.querySelectorAll('.chart-tab-btn').forEach(function(btn) {{
+            btn.addEventListener('click', function() {{
+                document.querySelectorAll('.chart-tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+                document.querySelectorAll('.chart-tab-pane').forEach(function(p) {{ p.classList.remove('active'); }});
+                btn.classList.add('active');
+                var tid = btn.dataset.tab;
+                document.getElementById(tid).classList.add('active');
+                var cid = 'chart_' + tid.replace('c_', '');
+                if (!rendered[cid]) {{
+                    Plotly.newPlot(cid, charts[cid].data, charts[cid].layout, {{responsive:true, displayModeBar:false}});
+                    rendered[cid] = true;
+                }}
+            }});
+        }});
+    }})();
     </script>"""
 
 
@@ -351,61 +484,108 @@ def _build_mapping_table(engine) -> str:
         if idx is not None:
             target_indices.update(range(max(0, idx - offset_n), min(len(history_data_ref), idx + offset_n + 1)))
 
-    rows_html = []
+    # ── 构建 Plotly 折线图替代表格 ──
+    chart_x, chart_y, chart_text, marker_colors, marker_sizes, marker_symbols = [], [], [], [], [], []
+    # 保留原始表格数据用于 hover
+    table_rows_for_hover = []
+
     for idx in sorted(target_indices):
         bar = history_data_ref[idx]
         dt = _norm_dt(bar.datetime)
         mapped_sym = bar_route_map.get(dt, "MISSING")
         phys_bar = physical_bars_map.get((mapped_sym, dt))
 
+        dt_str = dt.strftime("%Y-%m-%d") if dt else "N/A"
         if phys_bar:
-            po, ph, pl, pc = (f"{phys_bar.open_price:.2f}", f"{phys_bar.high_price:.2f}", f"{phys_bar.low_price:.2f}",
-                              f"{phys_bar.close_price:.2f}")
             diff_val = bar.close_price - phys_bar.close_price
-            close_diff = f"<span class='diff-val'>{diff_val:+.2f}</span>"
         else:
-            po = ph = pl = pc = "<span class='val-na'>N/A</span>"
-            close_diff = "<span class='val-na'>N/A</span>"
+            diff_val = None
 
         is_cost = dt in rollover_cost_dts
         is_route = dt in route_change_set
-        if is_cost and is_route: flag, row_cls = "🔄 BOTH", "row-both"
-        elif is_cost: flag, row_cls = "💰 ROLLOVER", "row-rollover"
-        elif is_route: flag, row_cls = "🧭 ROUTE", "row-route"
-        else: flag, row_cls = "", ""
+        if is_cost and is_route:
+            flag, color, size, sym_shape = "BOTH", "#22d3ee", 12, "diamond"
+        elif is_cost:
+            flag, color, size, sym_shape = "ROLLOVER", "#f59e0b", 10, "triangle-up"
+        elif is_route:
+            flag, color, size, sym_shape = "ROUTE", "#f87171", 10, "circle"
+        else:
+            flag, color, size, sym_shape = "", "#64748b", 6, "circle"
 
-        dt_str = dt.strftime("%Y-%m-%d %H:%M") if dt else "N/A"
-        rows_html.append(f"""<tr class='{row_cls}'>
-            <td class='mono'>{dt_str}</td>
-            <td class='mono sym-cell'>{mapped_sym}</td>
-            <td class='mono'>{bar.open_price:.2f}</td><td class='mono'>{bar.high_price:.2f}</td>
-            <td class='mono'>{bar.low_price:.2f}</td><td class='mono'>{bar.close_price:.2f}</td>
-            <td class='mono'>{po}</td><td class='mono'>{ph}</td>
-            <td class='mono'>{pl}</td><td class='mono'>{pc}</td>
-            <td class='mono'>{close_diff}</td>
-            <td class='event-flag'>{flag}</td>
-        </tr>""")
+        if diff_val is not None:
+            hover = f"{dt_str}<br>{mapped_sym}<br>Close Diff: {diff_val:+.2f}"
+            if flag:
+                hover += f"<br>事件: {flag}"
+            chart_x.append(dt_str)
+            chart_y.append(diff_val)
+            chart_text.append(hover)
+            marker_colors.append(color)
+            marker_sizes.append(size)
+            marker_symbols.append(sym_shape)
+
+    if not chart_x:
+        return "<div class='empty-state'>未生成对账图：无有效价差数据。</div>"
+
+    line_trace = dict(type="scatter",
+                      mode="lines+markers",
+                      x=chart_x,
+                      y=chart_y,
+                      text=chart_text,
+                      hoverinfo="text",
+                      line=dict(color="rgba(59,130,246,0.5)", width=1),
+                      marker=dict(color=marker_colors,
+                                  size=marker_sizes,
+                                  symbol=marker_symbols,
+                                  line=dict(color="rgba(255,255,255,0.3)", width=1)),
+                      name="Close Diff")
+
+    zeroline = dict(type="scatter",
+                    mode="lines",
+                    x=[chart_x[0], chart_x[-1]],
+                    y=[0, 0],
+                    line=dict(color="rgba(255,255,255,0.15)", width=1, dash="dot"),
+                    hoverinfo="skip",
+                    showlegend=False)
+
+    layout = dict(
+        height=300,
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        margin=dict(l=55, r=20, t=16, b=50),
+        font=dict(family="'IBM Plex Mono', monospace", size=11, color="#94a3b8"),
+        xaxis=dict(type="category", tickangle=-30, showgrid=True, gridcolor="rgba(255,255,255,0.05)"),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", title=dict(text="Close Diff", font=dict(size=10))),
+        hovermode="closest",
+    )
+
+    import json as _json
+    chart_json = _json.dumps({"data": [zeroline, line_trace], "layout": layout})
+
+    legend_html = """<div class="mapping-legend">
+        <span class="ml-item"><span class="ml-dot" style="background:#f87171;"></span>🧭 ROUTE</span>
+        <span class="ml-item"><span class="ml-dot ml-tri" style="background:#f59e0b;"></span>💰 ROLLOVER</span>
+        <span class="ml-item"><span class="ml-dot ml-dia" style="background:#22d3ee;"></span>🔄 BOTH</span>
+        <span class="ml-item"><span class="ml-dot" style="background:#64748b;"></span>普通</span>
+    </div>"""
 
     return f"""
     <div class="section-card">
         <div class="section-header">
             <span class="section-icon">📐</span>
             <span>连续合约 K 线对账</span>
-            <span class="section-sub">切换点 ±{offset_n} 根</span>
+            <span class="section-sub">切换点 ±{offset_n} 根 · Close Diff 走势</span>
         </div>
-        <p class="hint-line">close_diff = 连续复权收盘 − 物理原始收盘，复权后差值非零属正常。
-        🔄 BOTH = 映射切换且有换月摩擦；💰 ROLLOVER = 有换月摩擦；🧭 ROUTE = 仅映射切换。</p>
-        <div class="scroll-box">
-            <table class="base-table mapping-table">
-                <thead><tr>
-                    <th>时间</th><th>物理合约</th>
-                    <th>连续O</th><th>连续H</th><th>连续L</th><th>连续C</th>
-                    <th>物理O</th><th>物理H</th><th>物理L</th><th>物理C</th>
-                    <th>Close Diff</th><th>事件</th>
-                </tr></thead>
-                <tbody>{"".join(rows_html)}</tbody>
-            </table>
-        </div>
+        <p class="hint-line">close_diff = 连续复权收盘 − 物理原始收盘，复权后差值非零属正常。悬停查看详情。</p>
+        {legend_html}
+        <div id="mapping_chart" style="width:100%;height:300px;"></div>
+        <script>
+        (function(){{
+            var d = {chart_json};
+            Plotly.newPlot('mapping_chart', d.data, d.layout, {{responsive:true, displayModeBar:false}});
+        }})();
+        </script>
     </div>"""
 
 
@@ -457,7 +637,8 @@ def _build_orders_table(engine) -> str:
             "vol": o.volume,
             "status": str(o.status.value),
             "source": audit.get("status_source", ""),
-            "reason": audit.get("status_reason", "")
+            "reason": audit.get("status_reason", ""),
+            "vt_orderid": o.vt_orderid
         })
 
     for so in engine.get_all_stop_orders():
@@ -473,7 +654,8 @@ def _build_orders_table(engine) -> str:
             "vol": so.volume,
             "status": str(so.status.value),
             "source": source,
-            "reason": reason
+            "reason": reason,
+            "vt_orderid": getattr(so, "stop_orderid", "N/A")
         })
 
     for bo in getattr(engine, "warmup_blocked_orders", []):
@@ -487,12 +669,15 @@ def _build_orders_table(engine) -> str:
             "vol": 0,
             "status": "BLOCKED",
             "source": "Engine_Interceptor",
-            "reason": f"{bo['reason']} ({bo['phase']})"
+            "reason": f"{bo['reason']} ({bo['phase']})",
+            "vt_orderid": "N/A"
         })
 
     all_orders.sort(key=lambda x: _normalize_dt(x["dt"]) if x["dt"] else pd.Timestamp.min)
     if not all_orders: return "<div class='empty-state'>无委托记录</div>"
 
+    tracker = getattr(engine, "intent_tracker", None)
+    orderid_chain_map = getattr(tracker, "orderid_chain_map", {}) if tracker else {}
     limit_count = sum(1 for o in all_orders if o["type"] == "Limit")
     stop_count = sum(1 for o in all_orders if o["type"] == "Stop")
     abnormal_count = 0
@@ -503,17 +688,28 @@ def _build_orders_table(engine) -> str:
         is_abnormal = ("撤销" in o["status"] or "拒单" in o["status"] or "CANCEL" in st_up or "REJECT" in st_up
                        or "BLOCKED" in st_up)
         if is_abnormal: abnormal_count += 1
-
         row_cls = "row-cancelled" if is_abnormal else "row-normal"
+
         badge = ""
         if o["reason"]: badge += f"<span class='reason-tag'>{html.escape(o['reason'])}</span>"
         if o["source"]: badge += f"<span class='source-tag'>{html.escape(o['source'])}</span>"
 
-        raw_dt = o["dt"]
-        dt_str = _normalize_dt(raw_dt).strftime("%Y-%m-%d %H:%M") if raw_dt is not None else "N/A"
+        dt_str = _normalize_dt(o["dt"]).strftime("%Y-%m-%d %H:%M") if o["dt"] is not None else "N/A"
+
+        # 【反向锚点】点击跳往 Chain ID
+        cid = orderid_chain_map.get(o["vt_orderid"], "") if o["vt_orderid"] != "N/A" else ""
+        if o["type"] == "Stop":
+            chain_cell = "<td class='mono'>[EXEMPT]</td>"
+        elif cid:
+            chain_cell = f'<td class="mono"><a class="chain-link" href="#chain-{cid}">{cid[:8]}...</a></td>'
+        else:
+            chain_cell = "<td class='mono muted'>—</td>"
+
+        row_id_attr = f"id='order-{o['vt_orderid']}'" if o["vt_orderid"] != "N/A" else ""
 
         rows.append(
-            f"<tr class='{row_cls}' data-type='{o['type'].lower()}' data-abnormal='{'true' if is_abnormal else 'false'}'>"
+            f"<tr class='{row_cls}' data-type='{o['type'].lower()}' data-abnormal='{'true' if is_abnormal else 'false'}' {row_id_attr}>"
+            f"{chain_cell}"
             f"<td class='mono'>{dt_str}</td><td class='mono sym-cell'>{html.escape(str(o['sym']))}</td>"
             f"<td>{o['type']}</td><td>{o['dir']}</td><td>{o['off']}</td>"
             f"<td class='mono'>{o['price']:.2f}</td><td>{o['vol']}</td>"
@@ -528,7 +724,7 @@ def _build_orders_table(engine) -> str:
     </div>
     <div class="scroll-box">
         <table class="base-table">
-            <thead><tr><th>发单时间</th><th>合约</th><th>类型</th><th>方向</th>
+            <thead><tr><th>Chain ID</th><th>发单时间</th><th>合约</th><th>类型</th><th>方向</th>
             <th>动作</th><th>价格</th><th>数量</th><th>状态/审计归因</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
         </table>
@@ -540,17 +736,32 @@ def _build_trades_table(engine) -> str:
     if not trades:
         return "<div class='empty-state'>无成交记录</div>"
 
+    tracker = getattr(engine, "intent_tracker", None)
+    orderid_chain_map = getattr(tracker, "orderid_chain_map", {}) if tracker else {}
+    exempt_records = getattr(tracker, "exempt_trade_records", []) if tracker else []
+    exempt_tradeids = {r["trade"].vt_tradeid for r in exempt_records}
+
     rows = []
     for t in trades:
         sym = getattr(t, "vt_symbol", f"{t.symbol}.{t.exchange.value}")
-        rows.append(f"<tr><td class='mono'>{pd.to_datetime(t.datetime).strftime('%Y-%m-%d %H:%M')}</td>"
+
+        if t.vt_tradeid in exempt_tradeids:
+            chain_cell = "<td class='mono'>[EXEMPT]</td>"
+        else:
+            cid = orderid_chain_map.get(t.vt_orderid, "")
+            # 【反向锚点】点击跳往 Chain ID
+            chain_cell = f'<td class="mono"><a class="chain-link" href="#chain-{cid}">{cid[:8]}...</a></td>' if cid else "<td class='mono muted'>—</td>"
+
+        rows.append(f"<tr>"
+                    f"{chain_cell}"
+                    f"<td class='mono'>{pd.to_datetime(t.datetime).strftime('%Y-%m-%d %H:%M')}</td>"
                     f"<td class='mono sym-cell'>{sym}</td><td>{t.direction.value}</td>"
                     f"<td>{t.offset.value}</td><td class='mono'>{t.price:.2f}</td>"
                     f"<td>{t.volume}</td></tr>")
 
     return f"""<div class="scroll-box">
         <table class="base-table">
-            <thead><tr><th>成交时间</th><th>合约</th><th>方向</th>
+            <thead><tr><th>Chain ID</th><th>成交时间</th><th>合约</th><th>方向</th>
             <th>动作</th><th>成交价</th><th>数量</th></tr></thead>
             <tbody>{"".join(rows)}</tbody>
         </table></div>"""
@@ -598,6 +809,7 @@ def generate_web_report(engine, df, stats, result_dir):
     orders_html = _build_orders_table(engine)
     trades_html = _build_trades_table(engine)
     rollover_html = _build_rollover_audit(engine)
+    intent_audit_html = _build_intent_audit_table(engine)
     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # 获取当前目录下的 templates 路径
@@ -624,7 +836,8 @@ def generate_web_report(engine, df, stats, result_dir):
                                .replace("{{ ROLLOVER_HTML }}", rollover_html) \
                                .replace("{{ ORDERS_HTML }}", orders_html) \
                                .replace("{{ TRADES_HTML }}", trades_html) \
-                               .replace("{{ STATS_HTML }}", stats_html)
+                               .replace("{{ STATS_HTML }}", stats_html)\
+                               .replace("{{ INTENT_AUDIT_HTML }}", intent_audit_html)
 
     # 写入最终结果
     report_file = os.path.join(result_dir, f"report_{datetime.now().strftime('%H%M%S')}.html")

@@ -17,6 +17,11 @@ from vnpy.trader.constant import (Direction, Offset, Exchange, Interval, Status)
 from vnpy.trader.database import get_database, BaseDatabase
 from vnpy.trader.object import OrderData, TradeData, BarData, TickData
 from vnpy.trader.utility import round_to, extract_vt_symbol
+from vnpy.trader.object import ContractData
+from .order_flow.tracker import IntentTracker
+from .order_flow.position_ledger import PositionLedger
+from .order_flow.pipeline import OrderPipeline
+from .order_flow.models import RiskDecision
 from vnpy.trader.optimize import (OptimizationSetting, check_optimization_setting, run_bf_optimization, run_ga_optimization)
 
 from .base import (BacktestingMode, EngineType, STOPORDER_PREFIX, StopOrder, StopOrderStatus, INTERVAL_DELTA_MAP)
@@ -110,6 +115,12 @@ class BacktestingEngine:
         self.data_load_error: str = ""
         self.backtest_failed: bool = False
         self.backtest_error: str = ""
+        self.intent_tracker = IntentTracker()
+        self.position_ledger = PositionLedger()
+        self.order_pipeline = OrderPipeline(self.intent_tracker)
+        # 更新快捷引用
+        self.actual_pos_map = self.position_ledger.actual_pos_map
+        self.chain_audit_map = self.intent_tracker.chain_audit_map
 
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
@@ -146,6 +157,12 @@ class BacktestingEngine:
         self.data_load_error = ""
         self.backtest_failed = False
         self.backtest_error = ""
+        self.intent_tracker = IntentTracker()
+        self.position_ledger = PositionLedger()
+        self.order_pipeline = OrderPipeline(self.intent_tracker)
+        # 更新快捷引用
+        self.actual_pos_map = self.position_ledger.actual_pos_map
+        self.chain_audit_map = self.intent_tracker.chain_audit_map
 
     def _normalize_datetime(self, dt) -> datetime:
         """
@@ -390,6 +407,24 @@ class BacktestingEngine:
             return
 
         self.output(_("历史数据构建完毕，回测段：{}根，暖机段：{}根").format(len(self.history_data), len(self.warmup_data)))
+
+    def _normalize_vt_symbol(self, symbol: str) -> str:
+        if "." in symbol:
+            return symbol
+        exchange = self.exchange.value if hasattr(self.exchange, "value") else str(self.exchange)
+        return f"{symbol}.{exchange}"
+
+    def _get_backtest_contract(self, vt_symbol: str) -> ContractData:
+        symbol, exchange = extract_vt_symbol(vt_symbol)
+        from vnpy.trader.constant import Product
+        return ContractData(symbol=symbol,
+                            exchange=exchange,
+                            name=symbol,
+                            product=Product.FUTURES,
+                            size=self.size,
+                            pricetick=self.pricetick,
+                            min_volume=1,
+                            gateway_name=self.gateway_name)
 
     def run_backtesting(self) -> None:
         if self.mode == BacktestingMode.BAR:
@@ -970,6 +1005,7 @@ class BacktestingEngine:
             else:
                 order.status = Status.PARTTRADED
 
+            self.intent_tracker.update_order(order)
             self._record_limit_order_history(order)
             self._call_strategy_on_order(order)
             self.trade_count += 1
@@ -995,9 +1031,15 @@ class BacktestingEngine:
             trade.physical_price = trade_price
             trade.price_offset = order_offset
 
-            self.strategy.pos += pos_change
+            # 仓位先更新，确保策略拿到最新仓位
+            self.strategy.pos = self.position_ledger.apply_trade(trade)
+
+            # 回调策略
             self._call_strategy_on_trade(trade)
+
+            # 落库并触发归档
             self.trades[trade.vt_tradeid] = trade
+            self.intent_tracker.record_trade(trade)
 
     def cross_stop_order(self) -> None:
         if self.mode == BacktestingMode.BAR:
@@ -1080,7 +1122,10 @@ class BacktestingEngine:
 
             self._call_strategy_on_stop_order(stop_order)
             self._call_strategy_on_order(order)
-            self.strategy.pos += pos_change
+            # 记录打标，并使用账本更新止损单的仓位
+            self.intent_tracker.mark_exempt(trade, reason="STOP_ORDER_TRIGGERED")
+            self.strategy.pos = self.position_ledger.apply_trade(trade)
+
             self._call_strategy_on_trade(trade)
             self.trades[trade.vt_tradeid] = trade
 
@@ -1143,13 +1188,38 @@ class BacktestingEngine:
         price = round_to(price, self.pricetick)
         if stop:
             vt_orderid = self.send_stop_order(direction, offset, price, volume)
-        else:
-            vt_orderid = self.send_limit_order(direction, offset, price, volume)
+            if vt_orderid:
+                self.output(f"[EXEMPT] 止损单跳过 V1.3 Pipeline: {vt_orderid}")
+            return [vt_orderid] if vt_orderid else []
 
-        # 🟢 【修复1】被拦截时抛出空列表，避免返回脏数据 [""]
-        if not vt_orderid:
+        target_vt_symbol = getattr(self, "current_physical_symbol", None) or self.vt_symbol
+        target_vt_symbol = self._normalize_vt_symbol(target_vt_symbol)
+        contract = self._get_backtest_contract(target_vt_symbol)
+
+        signal, risk_order, execution = self.order_pipeline.process_signal(strategy.strategy_name,
+                                                                           target_vt_symbol,
+                                                                           direction,
+                                                                           offset,
+                                                                           price,
+                                                                           volume,
+                                                                           lock,
+                                                                           net,
+                                                                           contract,
+                                                                           created_at=self.datetime)
+
+        if risk_order.decision != RiskDecision.PASS:
+            self.output(f"[RISK_REJECT] {signal.chain_id}: {risk_order.reject_reason}")
             return []
-        return [vt_orderid]
+
+        vt_orderid = self.send_limit_order(execution.direction, execution.offset, execution.rounded_price,
+                                           execution.rounded_volume)
+        if vt_orderid:
+            order = self.limit_orders.get(vt_orderid)
+            self.intent_tracker.bind_order(vt_orderid, signal.chain_id, execution.exec_id, execution.rounded_volume)
+            if order:
+                self.intent_tracker.update_order(order)
+            return [vt_orderid]
+        return []
 
     def send_stop_order(self, direction: Direction, offset: Offset, price: float, volume: float) -> str:
         # 防止暖机期产生幽灵止损单
@@ -1197,6 +1267,7 @@ class BacktestingEngine:
         if vt_orderid not in self.active_limit_orders: return
         order: OrderData = self.active_limit_orders.pop(vt_orderid)
         order.status = Status.CANCELLED
+        self.intent_tracker.update_order(order)
         self.limit_orders[vt_orderid] = order
         self._record_limit_order_history(order)  # 撤单快照
         self.set_order_audit(order, reason, source)

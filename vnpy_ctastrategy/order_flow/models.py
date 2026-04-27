@@ -1,6 +1,6 @@
+from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime
 from vnpy.trader.constant import Direction, Offset
 
 
@@ -66,4 +66,8 @@ class PhysicalOrderRef:
     vt_orderid: str
     chain_id: str
     exec_id: str
+    status: object = None
+    volume: float = 0
+    traded: float = 0
     created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = None

@@ -20,11 +20,13 @@ document.getElementById("dynamic-style").innerHTML = `{{ STYLE_CONTENT }}`;
         <div class="title">CTA REPORT</div>
         <div class="sub">V1.2.1 · PHASE 1</div>
     </div>
-    <a class="nav-item active" href="#qa"><span class="nav-icon">🛡</span>QA 审计</a>
+    <a class="nav-item" href="#qa"><span class="nav-icon">🛡</span>QA 审计</a>
     <a class="nav-item" href="#mapping"><span class="nav-icon">📐</span>K 线对账</a>
     <a class="nav-item" href="#chart"><span class="nav-icon">📈</span>收益图表</a>
     <a class="nav-item" href="#daily"><span class="nav-icon">📅</span>日度明细</a>
     <a class="nav-item" href="#rollover"><span class="nav-icon">🔄</span>换月审计</a>
+    
+    <a class="nav-item" href="#intent-audit"><span class="nav-icon">🔗</span>意图链路</a>
     <a class="nav-item" href="#orders"><span class="nav-icon">📋</span>订单记录</a>
     <a class="nav-item" href="#trades"><span class="nav-icon">✅</span>成交记录</a>
 </nav>
@@ -40,33 +42,43 @@ document.getElementById("dynamic-style").innerHTML = `{{ STYLE_CONTENT }}`;
 
     <div class="layout-grid">
         <div class="layout-left">
-            <div data-section="qa">{{ QA_HTML }}</div>
-            <div data-section="mapping">{{ MAPPING_HTML }}</div>
-            <div class="section-card" data-section="chart">
+            <div id="qa" data-section="qa">{{ QA_HTML }}</div>
+            <div id="mapping" data-section="mapping">{{ MAPPING_HTML }}</div>
+            <div id="chart" class="section-card" data-section="chart">
                 <div class="section-header">
                     <span class="section-icon">📈</span><span>收益图表</span><span class="section-sub">净值 / 回撤 / 盈亏</span>
                 </div>
                 <div class="section-pad">{{ CHART_HTML }}</div>
             </div>
-            <div class="section-card" data-section="daily">
+            <div id="daily" class="section-card" data-section="daily">
                 <div class="section-header">
                     <span class="section-icon">📅</span><span>日度结算明细</span><span class="section-sub">倒序排列</span>
                 </div>
                 <div>{{ DAILY_HTML }}</div>
             </div>
-            <div class="section-card" data-section="rollover">
+            <div id="rollover" class="section-card" data-section="rollover">
                 <div class="section-header">
                     <span class="section-icon">🔄</span><span>换月事件审计</span><span class="section-sub">摩擦成本账本</span>
                 </div>
                 <div class="section-pad">{{ ROLLOVER_HTML }}</div>
             </div>
-            <div class="section-card" data-section="orders">
+            <div id="intent-audit" class="section-card" data-section="intent-audit">
+                <div class="section-header">
+                    <span class="section-icon">🔗</span>
+                    <span>意图链路审计</span>
+                    <span class="section-sub">Intent-to-Fill Traceability</span>
+                </div>
+                <div>{{ INTENT_AUDIT_HTML }}</div>
+            </div>
+
+            <div id="orders" class="section-card" data-section="orders">
                 <div class="section-header">
                     <span class="section-icon">📋</span><span>订单生命周期</span>
                 </div>
                 <div>{{ ORDERS_HTML }}</div>
             </div>
-            <div class="section-card" data-section="trades">
+
+            <div id="trades" class="section-card" data-section="trades">
                 <div class="section-header">
                     <span class="section-icon">✅</span><span>物理成交记录</span>
                 </div>

@@ -227,3 +227,93 @@ body {
 /* 折叠面板 */
 details.section-card > summary { list-style: none; cursor: pointer; outline: none; }
 details.section-card > summary::-webkit-details-marker { display: none; }
+/* ── 收益图表选项卡 ── */
+.chart-tabs {
+    display: flex; gap: 4px;
+    padding: 12px 16px 0;
+    border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.01);
+}
+.chart-tab-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: 2px solid transparent;
+    color: var(--muted);
+    padding: 6px 14px 8px;
+    font-size: 0.73rem; font-family: var(--font);
+    cursor: pointer; border-radius: 4px 4px 0 0;
+    transition: color 0.15s, border-color 0.15s;
+    margin-bottom: -1px;
+}
+.chart-tab-btn:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+.chart-tab-btn.active {
+    color: var(--accent);
+    border-color: var(--border) var(--border) var(--surface);
+    border-bottom-color: var(--surface);
+    background: var(--surface);
+}
+.chart-tab-pane { display: none; padding: 12px 4px 4px; }
+.chart-tab-pane.active { display: block; }
+
+/* ── K 线对账图例 ── */
+.mapping-legend {
+    display: flex; gap: 16px; align-items: center;
+    padding: 8px 14px;
+    font-size: 0.72rem; color: var(--muted);
+}
+.ml-item { display: flex; align-items: center; gap: 6px; }
+.ml-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block; flex-shrink: 0;
+}
+.ml-tri  { clip-path: polygon(50% 0%, 0% 100%, 100% 100%); border-radius: 0; }
+.ml-dia  { transform: rotate(45deg); border-radius: 1px; }
+
+/* ── 意图链路审计（暗色主题修正） ── */
+.audit-table { width: 100%; }
+.audit-row-pass td   { color: var(--text); }
+.audit-row-reject td { background: rgba(248,113,113,0.08) !important; }
+.audit-row-exempt td { background: rgba(245,158,11,0.08) !important; }
+.audit-risk-pass     { color: var(--green); font-weight: 600; }
+.audit-risk-reject   { color: var(--red); font-weight: 600; }
+.audit-risk-exempt   { color: var(--muted); }
+.audit-status-reject { color: var(--red); font-weight: 600; }
+.audit-status-exempt { color: var(--gold); }
+.audit-reason        { font-size: 0.72rem; color: var(--muted); font-family: var(--mono); }
+
+/* 链路跳转锚点样式 */
+.chain-link, .chain-anchor {
+    color: var(--accent2);
+    text-decoration: none;
+    font-family: var(--mono);
+    font-weight: bold;
+}
+.chain-link:hover, .chain-anchor:hover {
+    color: var(--accent);
+    text-decoration: underline;
+}
+/* 锚点被跳转到时，单元格闪烁高亮，!important 防止被原样式覆盖 */
+tr:target td {
+    animation: chain-flash 1.5s ease-out;
+}
+@keyframes chain-flash {
+    0%   { background-color: rgba(34, 211, 238, 0.4) !important; }
+    100% { background-color: transparent; }
+}
+/* V1.3 审计表：不横向滚动，长内容自动换行 */
+.audit-table-wrap {
+    width: 100%;
+    table-layout: fixed;
+}
+.audit-table-wrap th,
+.audit-table-wrap td {
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    vertical-align: top;
+    line-height: 1.45;
+}
+.audit-table-wrap .chain-id-cell {
+    width: 22%;
+    min-width: 0;
+}
