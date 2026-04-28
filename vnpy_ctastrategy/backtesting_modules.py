@@ -5,6 +5,7 @@ from vnpy.trader.object import OrderData, TradeData, BarData, TickData
 from vnpy.trader.constant import Direction
 
 from .base import StopOrder
+from .order_flow.friction import ExecutionMatchResult, MatchBehavior, SlippageResult, CommissionResult
 
 
 class BaseMarginModel(ABC):
@@ -41,6 +42,14 @@ class BaseExecutionModel(ABC):
         """返回: (trade_price, trade_volume) -> 如果未成交，返回 (0.0, 0.0)"""
         pass
 
+    def match_limit_order_v14(self, order: OrderData, data_point: Union[BarData, TickData]) -> ExecutionMatchResult:
+        """V1.4 兼容接口，默认由具体模型覆盖。"""
+        raise NotImplementedError
+
+    def match_stop_order_v14(self, stop_order: StopOrder, data_point: Union[BarData, TickData]) -> ExecutionMatchResult:
+        """V1.4 兼容接口，默认由具体模型覆盖。"""
+        raise NotImplementedError
+
 
 class BaseCommissionModel(ABC):
     """【成本模型】预留：未来处理阶梯费率、平今仓惩罚费率等复杂结构"""
@@ -72,6 +81,18 @@ class V1DefaultSlippageModel(BaseSlippageModel):
     def get_slippage(self, trade: TradeData, size: float) -> float:
         return trade.volume * size * self.slippage
 
+    def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
+        """V1.4: embed slippage into the execution price."""
+        if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
+            return SlippageResult(match_result.match_price, 0.0, "V1_Default_Slippage")
+
+        execution_price = match_result.match_price + (self.slippage if order.direction == Direction.LONG else -self.slippage)
+        return SlippageResult(
+            execution_price=execution_price,
+            price_diff=execution_price - match_result.match_price,
+            model_name="V1_Default_Slippage",
+        )
+
 
 class V1DefaultCommissionModel(BaseCommissionModel):
     """V1 默认手续费模型：支持按比例(turnover)或按手数(volume)"""
@@ -88,6 +109,13 @@ class V1DefaultCommissionModel(BaseCommissionModel):
             # 按成交额比例收费 (例如：万分之一)
             turnover = trade.volume * size * trade.price
             return turnover * self.rate
+
+    def calculate_v14(self, trade: TradeData, contract_multiplier: float) -> CommissionResult:
+        """V1.4: structured commission result shared by PnL and audit."""
+        return CommissionResult(
+            commission_amount=self.get_commission(trade, contract_multiplier),
+            model_name="V1_Default_Commission",
+        )
 
 
 class V1DefaultExecutionModel(BaseExecutionModel):
@@ -109,6 +137,43 @@ class V1DefaultExecutionModel(BaseExecutionModel):
 
         trade_price = min(order.price, long_best_price) if long_cross else max(order.price, short_best_price)
         return trade_price, order.volume
+
+    def match_limit_order_v14(self, order: OrderData, data_point: Union[BarData, TickData]) -> ExecutionMatchResult:
+        """V1.4: return explicit matching behavior for audit and friction models."""
+        if isinstance(data_point, BarData):
+            open_price = data_point.open_price
+            low_price = data_point.low_price
+            high_price = data_point.high_price
+        else:
+            open_price = low_price = high_price = data_point.last_price
+
+        matched = False
+        trade_price = 0.0
+        behavior = MatchBehavior.PASSIVE_LIMIT
+
+        if order.direction == Direction.LONG:
+            if order.price >= open_price and open_price > 0:
+                matched, trade_price, behavior = True, open_price, MatchBehavior.AGGRESSIVE_LIMIT
+            elif order.price >= low_price and low_price > 0:
+                matched, trade_price, behavior = True, order.price, MatchBehavior.PASSIVE_LIMIT
+        else:
+            if order.price <= open_price and open_price > 0:
+                matched, trade_price, behavior = True, open_price, MatchBehavior.AGGRESSIVE_LIMIT
+            elif order.price <= high_price and high_price > 0:
+                matched, trade_price, behavior = True, order.price, MatchBehavior.PASSIVE_LIMIT
+
+        if not matched:
+            return ExecutionMatchResult(False, order.price, 0.0, 0.0, behavior)
+
+        trade_volume = order.volume - order.traded
+        return ExecutionMatchResult(True, order.price, trade_price, trade_volume, behavior)
+
+    def match_stop_order_v14(self, stop_order: StopOrder, data_point: Union[BarData, TickData]) -> ExecutionMatchResult:
+        """V1.4: reuse legacy stop trigger and tag STOP_TRIGGERED explicitly."""
+        trade_price, trade_volume = self.match_stop_order(stop_order, data_point)
+        if trade_volume == 0:
+            return ExecutionMatchResult(False, stop_order.price, 0.0, 0.0, MatchBehavior.STOP_TRIGGERED)
+        return ExecutionMatchResult(True, stop_order.price, trade_price, trade_volume, MatchBehavior.STOP_TRIGGERED)
 
     def match_stop_order(self, stop_order: StopOrder, data_point: Union[BarData, TickData]) -> Tuple[float, float]:
         if isinstance(data_point, BarData):

@@ -57,7 +57,14 @@ class IntentTracker:
                 break
         self.try_archive(chain_id)
 
-    def record_trade(self, trade: TradeData) -> None:
+    def record_trade(
+        self,
+        trade: TradeData,
+        match_result=None,
+        slippage_result=None,
+        commission_result=None,
+        contract_multiplier: float = 1.0,
+    ) -> None:
         if trade.vt_tradeid in self.exempt_tradeids:
             return
 
@@ -66,13 +73,37 @@ class IntentTracker:
             self.untracked_trade_count += 1
             return
 
-        self.chain_audit_map[chain_id]["trades"].append(trade)
+        trade_record = {
+            "trade": trade,
+            "match_result": match_result,
+            "slippage_result": slippage_result,
+            "commission_result": commission_result,
+            "contract_multiplier": contract_multiplier,
+        }
+        self.chain_audit_map[chain_id]["trades"].append(trade_record)
         self.try_archive(chain_id)
 
-    def mark_exempt(self, trade: TradeData, reason: str = "STOP_ORDER"):
+    def record_standalone_trade(
+        self,
+        trade: TradeData,
+        reason: str = "STOP_ORDER",
+        match_result=None,
+        slippage_result=None,
+        commission_result=None,
+        contract_multiplier: float = 1.0,
+    ) -> None:
         self.exempt_tradeids.add(trade.vt_tradeid)
-        # 统一使用 dict 存储，避免动态属性污染
-        self.exempt_trade_records.append({"trade": trade, "reason": reason})
+        self.exempt_trade_records.append({
+            "trade": trade,
+            "reason": reason,
+            "match_result": match_result,
+            "slippage_result": slippage_result,
+            "commission_result": commission_result,
+            "contract_multiplier": contract_multiplier,
+        })
+
+    # Backward-compatible alias for existing report/test code.
+    mark_exempt = record_standalone_trade
 
     def try_archive(self, chain_id: str) -> None:
         record = self.chain_audit_map.get(chain_id)
@@ -88,11 +119,28 @@ class IntentTracker:
 
         all_terminal = all(ref.status in TERMINAL_STATUSES for ref in record["orders"])
         total_traded_in_orders = sum(ref.traded for ref in record["orders"])
-        total_traded_in_trades = sum(t.volume for t in record["trades"])
+        total_traded_in_trades = sum(t["trade"].volume for t in record["trades"])
 
         # 引入 1e-8 浮点容差，防止浮点误差导致终态卡死
         all_trades_recorded = math.isclose(total_traded_in_orders, total_traded_in_trades, abs_tol=1e-8)
 
         if all_terminal and all_trades_recorded:
             record["archived_at"] = datetime.now()
+
+            total_slippage_cost = 0.0
+            total_commission_cost = 0.0
+            for t_record in record["trades"]:
+                multiplier = t_record.get("contract_multiplier", 1.0)
+                slip_res = t_record.get("slippage_result")
+                comm_res = t_record.get("commission_result")
+
+                if slip_res:
+                    total_slippage_cost += abs(slip_res.price_diff) * t_record["trade"].volume * multiplier
+                if comm_res:
+                    total_commission_cost += comm_res.commission_amount
+
+            record["summary"] = {
+                "slippage_cost": total_slippage_cost,
+                "commission_cost": total_commission_cost,
+            }
             self.chain_audit_archive.append(self.chain_audit_map.pop(chain_id))

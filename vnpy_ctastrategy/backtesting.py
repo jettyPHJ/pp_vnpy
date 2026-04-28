@@ -58,6 +58,8 @@ class BacktestingEngine:
         self.half_life: int = 120
         self.mode: BacktestingMode = BacktestingMode.BAR
         self.by_volume: bool = False  # 🟢 暴露按手收费参数
+        self.friction_mode: str = "legacy"
+        self.trade_friction_map: dict[str, dict] = {}
 
         self.strategy_class: type[CtaTemplate]
         self.strategy: CtaTemplate
@@ -121,6 +123,8 @@ class BacktestingEngine:
         # 更新快捷引用
         self.actual_pos_map = self.position_ledger.actual_pos_map
         self.chain_audit_map = self.intent_tracker.chain_audit_map
+        self.exempt_trade_records = self.intent_tracker.exempt_trade_records
+        self.chain_audit_archive = self.intent_tracker.chain_audit_archive
 
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
@@ -132,6 +136,7 @@ class BacktestingEngine:
         self.active_limit_orders.clear()
         self.trade_count = 0
         self.trades.clear()
+        self.trade_friction_map.clear()
         self.logs.clear()
         self.daily_results.clear()
 
@@ -163,6 +168,8 @@ class BacktestingEngine:
         # 更新快捷引用
         self.actual_pos_map = self.position_ledger.actual_pos_map
         self.chain_audit_map = self.intent_tracker.chain_audit_map
+        self.exempt_trade_records = self.intent_tracker.exempt_trade_records
+        self.chain_audit_archive = self.intent_tracker.chain_audit_archive
 
     def _normalize_datetime(self, dt) -> datetime:
         """
@@ -272,7 +279,10 @@ class BacktestingEngine:
         total_slippage = sum([result.slippage for result in self.daily_results.values()])
         rollover_from_logs = sum([log.get("rollover_pnl", 0) for log in self.rollover_logs])
 
-        expected_net_pnl = theoretical_pnl - total_commission - total_slippage + rollover_from_logs
+        if getattr(self, "friction_mode", "legacy") == "legacy":
+            expected_net_pnl = theoretical_pnl - total_commission - total_slippage + rollover_from_logs
+        else:
+            expected_net_pnl = theoretical_pnl - total_commission + rollover_from_logs
 
         # 核心断言逻辑 (容忍极小的浮点数误差)
         tolerance = 1e-4
@@ -311,7 +321,8 @@ class BacktestingEngine:
                        half_life: int = 120,
                        physical_symbols: list = None,
                        by_volume: bool = False,
-                       warmup_days: int = 120) -> None:
+                       warmup_days: int = 120,
+                       friction_mode: str = "legacy") -> None:
         """"""
         self.mode = mode
         self.vt_symbol = vt_symbol
@@ -322,6 +333,7 @@ class BacktestingEngine:
         self.pricetick = pricetick
         self.start = start
         self.by_volume = by_volume
+        self.friction_mode = friction_mode
 
         self.symbol, exchange_str = self.vt_symbol.split(".")
         self.exchange = Exchange(exchange_str)
@@ -485,7 +497,15 @@ class BacktestingEngine:
 
         for d in sorted(self.daily_results.keys()):
             daily_result = self.daily_results[d]
-            daily_result.calculate_pnl(pre_close, start_pos, self.size, self.commission_model, self.slippage_model)
+            daily_result.calculate_pnl(
+                pre_close,
+                start_pos,
+                self.size,
+                self.commission_model,
+                self.slippage_model,
+                friction_mode=self.friction_mode,
+                trade_friction_map=self.trade_friction_map,
+            )
             pre_close = daily_result.close_price
             start_pos = daily_result.end_pos
 
@@ -651,7 +671,10 @@ class BacktestingEngine:
             self.output(_("最大回撤天数: \t{}").format(max_drawdown_duration))
             self.output(_("总盈亏：\t{:,.2f}").format(total_net_pnl))
             self.output(_("总手续费：\t{:,.2f}").format(total_commission))
-            self.output(_("总滑点：\t{:,.2f}").format(total_slippage))
+            if getattr(self, "friction_mode", "legacy") == "legacy":
+                self.output(_("总滑点（独立扣减项）：\t{:,.2f}").format(total_slippage))
+            else:
+                self.output(_("总滑点（已内嵌至成交价）：\t{:,.2f}").format(total_slippage))
             self.output(_("总成交金额：\t{:,.2f}").format(total_turnover))
             self.output(_("总成交笔数：\t{}").format(total_trade_count))
             self.output(_("日均盈亏：\t{:,.2f}").format(daily_net_pnl))
@@ -669,6 +692,9 @@ class BacktestingEngine:
         # 统计完成后，自动执行底层的强制对账
         self._audit_financial_consistency()
 
+        embedded_slippage_cost = total_slippage if getattr(self, "friction_mode", "legacy") == "v1.4" else 0.0
+        deducted_slippage_cost = total_slippage if getattr(self, "friction_mode", "legacy") == "legacy" else 0.0
+
         statistics: dict = {
             "start_date": start_date,
             "end_date": end_date,
@@ -685,6 +711,8 @@ class BacktestingEngine:
             "total_commission": total_commission,
             "daily_commission": daily_commission,
             "total_slippage": total_slippage,
+            "embedded_slippage_cost": embedded_slippage_cost,
+            "deducted_slippage_cost": deducted_slippage_cost,
             "daily_slippage": daily_slippage,
             "total_turnover": total_turnover,
             "daily_turnover": daily_turnover,
@@ -986,7 +1014,8 @@ class BacktestingEngine:
             current_data = self.tick
 
         for order in list(self.active_limit_orders.values()):
-            if order.vt_orderid not in self.active_limit_orders: continue
+            if order.vt_orderid not in self.active_limit_orders:
+                continue
 
             # [修复] 初始状态流转也必须记入快照与隔离回调
             if order.status == Status.SUBMITTING:
@@ -994,8 +1023,72 @@ class BacktestingEngine:
                 self._record_limit_order_history(order)
                 self._call_strategy_on_order(order)
 
+            if getattr(self, "friction_mode", "legacy") == "v1.4":
+                match_res = self.execution_model.match_limit_order_v14(order, current_data)
+                if not match_res.matched:
+                    continue
+
+                trade_volume = min(match_res.volume, order.volume - order.traded)
+                order.traded += trade_volume
+                if order.traded == order.volume:
+                    order.status = Status.ALLTRADED
+                    self.active_limit_orders.pop(order.vt_orderid, None)
+                else:
+                    order.status = Status.PARTTRADED
+
+                self.intent_tracker.update_order(order)
+                self._record_limit_order_history(order)
+                self._call_strategy_on_order(order)
+                self.trade_count += 1
+
+                vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
+                pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
+                self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
+
+                slip_res = self.slippage_model.calculate_v14(order, match_res, self.size)
+                trade: TradeData = TradeData(
+                    symbol=order.symbol,
+                    exchange=order.exchange,
+                    orderid=order.orderid,
+                    tradeid=str(self.trade_count),
+                    direction=order.direction,
+                    offset=order.offset,
+                    price=slip_res.execution_price,
+                    volume=trade_volume,
+                    datetime=self.datetime,
+                    gateway_name=self.gateway_name,
+                )
+
+                order_offset = getattr(order, "price_offset", 0.0)
+                trade.accounting_price = slip_res.execution_price + order_offset
+                trade.physical_price = slip_res.execution_price
+                trade.price_offset = order_offset
+
+                comm_res = self.commission_model.calculate_v14(trade, self.size)
+                slippage_cost = abs(slip_res.price_diff) * trade_volume * self.size
+                self.trade_friction_map[trade.vt_tradeid] = {
+                    "slippage_cost": slippage_cost,
+                    "commission_cost": comm_res.commission_amount,
+                    "match_result": match_res,
+                    "slippage_result": slip_res,
+                    "commission_result": comm_res,
+                }
+
+                self.strategy.pos = self.position_ledger.apply_trade(trade)
+                self._call_strategy_on_trade(trade)
+                self.trades[trade.vt_tradeid] = trade
+                self.intent_tracker.record_trade(
+                    trade,
+                    match_result=match_res,
+                    slippage_result=slip_res,
+                    commission_result=comm_res,
+                    contract_multiplier=self.size,
+                )
+                continue
+
             trade_price, trade_volume = self.execution_model.match_limit_order(order, current_data)
-            if trade_volume == 0: continue
+            if trade_volume == 0:
+                continue
 
             trade_volume = min(trade_volume, order.volume - order.traded)
             order.traded += trade_volume
@@ -1054,8 +1147,15 @@ class BacktestingEngine:
             current_data = self.tick
 
         for stop_order in list(self.active_stop_orders.values()):
-            trade_price, trade_volume = self.execution_model.match_stop_order(stop_order, current_data)
-            if trade_volume == 0: continue
+            if getattr(self, "friction_mode", "legacy") == "v1.4":
+                match_res = self.execution_model.match_stop_order_v14(stop_order, current_data)
+                trade_price, trade_volume = match_res.match_price, match_res.volume
+            else:
+                match_res = None
+                trade_price, trade_volume = self.execution_model.match_stop_order(stop_order, current_data)
+
+            if trade_volume == 0:
+                continue
 
             trade_volume = min(trade_volume, stop_order.volume)
             self.limit_order_count += 1
@@ -1100,20 +1200,40 @@ class BacktestingEngine:
             pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
             self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
 
+            if getattr(self, "friction_mode", "legacy") == "v1.4":
+                slip_res = self.slippage_model.calculate_v14(order, match_res, self.size)
+                execution_price = slip_res.execution_price
+            else:
+                slip_res = None
+                execution_price = trade_price
+
             trade: TradeData = TradeData(symbol=order.symbol,
                                          exchange=order.exchange,
                                          orderid=order.orderid,
                                          tradeid=str(self.trade_count),
                                          direction=order.direction,
                                          offset=order.offset,
-                                         price=trade_price,
+                                         price=execution_price,
                                          volume=trade_volume,
                                          datetime=self.datetime,
                                          gateway_name=self.gateway_name)
 
-            trade.accounting_price = trade_price + order_offset
-            trade.physical_price = trade_price
+            trade.accounting_price = execution_price + order_offset
+            trade.physical_price = execution_price
             trade.price_offset = order_offset
+
+            if getattr(self, "friction_mode", "legacy") == "v1.4":
+                comm_res = self.commission_model.calculate_v14(trade, self.size)
+                slippage_cost = abs(slip_res.price_diff) * trade_volume * self.size
+                self.trade_friction_map[trade.vt_tradeid] = {
+                    "slippage_cost": slippage_cost,
+                    "commission_cost": comm_res.commission_amount,
+                    "match_result": match_res,
+                    "slippage_result": slip_res,
+                    "commission_result": comm_res,
+                }
+            else:
+                comm_res = None
 
             stop_order.vt_orderids.append(order.vt_orderid)
             stop_order.status = StopOrderStatus.TRIGGERED
@@ -1123,7 +1243,17 @@ class BacktestingEngine:
             self._call_strategy_on_stop_order(stop_order)
             self._call_strategy_on_order(order)
             # 记录打标，并使用账本更新止损单的仓位
-            self.intent_tracker.mark_exempt(trade, reason="STOP_ORDER_TRIGGERED")
+            if getattr(self, "friction_mode", "legacy") == "v1.4":
+                self.intent_tracker.record_standalone_trade(
+                    trade,
+                    reason="STOP_ORDER_TRIGGERED",
+                    match_result=match_res,
+                    slippage_result=slip_res,
+                    commission_result=comm_res,
+                    contract_multiplier=self.size,
+                )
+            else:
+                self.intent_tracker.mark_exempt(trade, reason="STOP_ORDER_TRIGGERED")
             self.strategy.pos = self.position_ledger.apply_trade(trade)
 
             self._call_strategy_on_trade(trade)
@@ -1412,8 +1542,16 @@ class DailyResult:
     def add_trade(self, trade: TradeData) -> None:
         self.trades.append(trade)
 
-    def calculate_pnl(self, pre_close: float, start_pos: float, size: float, commission_model: BaseCommissionModel,
-                      slippage_model: BaseSlippageModel) -> None:
+    def calculate_pnl(
+        self,
+        pre_close: float,
+        start_pos: float,
+        size: float,
+        commission_model: BaseCommissionModel,
+        slippage_model: BaseSlippageModel,
+        friction_mode: str = "legacy",
+        trade_friction_map: dict | None = None,
+    ) -> None:
         if pre_close:
             self.pre_close = pre_close
         else:
@@ -1424,6 +1562,7 @@ class DailyResult:
 
         self.holding_pnl = self.start_pos * (self.close_price - self.pre_close) * size
         self.trade_count = len(self.trades)
+        trade_friction_map = trade_friction_map or {}
 
         for trade in self.trades:
             if trade.direction == Direction.LONG:
@@ -1434,8 +1573,14 @@ class DailyResult:
             self.end_pos += pos_change
 
             turnover: float = trade.volume * size * trade.price
-            self.slippage += slippage_model.get_slippage(trade, size)
-            self.commission += commission_model.get_commission(trade, size)
+            if friction_mode == "legacy":
+                self.slippage += slippage_model.get_slippage(trade, size)
+                self.commission += commission_model.get_commission(trade, size)
+            else:
+                friction_data = trade_friction_map.get(trade.vt_tradeid, {})
+                self.commission += friction_data.get("commission_cost", commission_model.get_commission(trade, size))
+                # V1.4 中该字段作为解释性统计，已内嵌在 trade.price，不参与 net_pnl 二次扣减。
+                self.slippage += friction_data.get("slippage_cost", 0.0)
             self.turnover += turnover
 
             # [绝对核心]：盯市必须用连续坐标系的 accounting_price
@@ -1443,7 +1588,10 @@ class DailyResult:
             self.trading_pnl += pos_change * (self.close_price - acct_price) * size
 
         self.total_pnl = self.trading_pnl + self.holding_pnl
-        self.net_pnl = self.total_pnl - self.commission - self.slippage + self.rollover_pnl
+        if friction_mode == "legacy":
+            self.net_pnl = self.total_pnl - self.commission - self.slippage + self.rollover_pnl
+        else:
+            self.net_pnl = self.total_pnl - self.commission + self.rollover_pnl
 
 
 @lru_cache(maxsize=999)

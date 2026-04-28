@@ -22,26 +22,27 @@ class V13MockStrategy(CtaTemplate):
         self.write_log("策略停止")
 
     def on_bar(self, bar: BarData):
-        # 👇 核心修复：拦截暖机期的 K 线，只在正式回测时计数和发单
         if not self.trading:
             return
 
         self.bar_count += 1
 
         if self.bar_count == 1:
-            # 开多 2 手：超高价保证必成 -> 走 PIPELINE
+            # 开多 2 手：超高价保证必成 -> 触发 AGGRESSIVE_LIMIT
             self.buy(bar.close_price + 1000, 2)
-
-            # 空头止损 1 手：设在极高价，下一根K线必然跌破，100% 触发 -> 走 EXEMPT
+            # 空头止损 1 手：100% 触发 -> 触发 STOP_TRIGGERED
             self.sell(bar.close_price + 1000, 1, stop=True)
 
+        elif self.bar_count == 3:
+            # 👈 新增：挂一个大概率被动成交的买单 (低于当前价，靠后续K线波动触发)
+            # 这会触发 PASSIVE_LIMIT 分支
+            self.buy(bar.close_price * 0.998, 1)
+
         elif self.bar_count == 5:
-            # 卖出 1 手平仓：超低价保证必成 -> 走 PIPELINE
-            # 累计：多2、止损空1、普通空1，仓位精确归 0
+            # 卖出平仓 -> 触发 AGGRESSIVE_LIMIT
             self.sell(bar.close_price - 1000, 1)
 
         elif self.bar_count == 8:
-            # 风控阻断：修改名称触发 DummyRiskManager 的拦截 -> 走 RISK_REJECT
             old_name = self.strategy_name
             self.strategy_name = "MALICIOUS_TEST_STRATEGY"
             self.buy(bar.close_price + 1000, 1)

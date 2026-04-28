@@ -1,80 +1,124 @@
-# 当前代码级执行清单 (Execution Checklist)
+# V1.4 执行摩擦模块化 实施蓝图
 
-> **当前聚焦版本:** V1.4 Execution Friction Modularization (执行摩擦模块化)
+> **核心定调** ：
+> 彻底分离“价格域（撮合改价）”与“金额域（财务归因）”。滑点直接体现在真实成交价（`TradeData.price`）中；引入 `ExecutionMatchResult` 将撮合意图与行为判定下沉；通过默认开启的 `legacy` 标志位和 Shim 机制实现新旧逻辑的绝对安全隔离。
 
-## 🚫 边界控制 (Non-Goals)
+---
 
-* ❌ **不污染原生对象**：严禁直接向 vn.py 的 `TradeData` 强行附加自定义字段。
-* ❌ **暂不引入多 K 线上下文**：V1.4 的模型仅依赖当前 K 线与订单本身。
-* ❌ **彻底禁用“负滑点奖励”**：限价单被动成交时，滑点强制设为 0。
+### 📦 施工包 1：数据结构与领域模型 (Domain Models)
 
-## 🛠 施工步骤 (Milestones)
+ **位置** : `vnpy_ctastrategy/order_flow/friction.py` (新建)
 
-### 🎯 Step 1: 模型解耦与物理归属
+**1. 撮合行为状态机 (`MatchBehavior`)**
 
-* **动作**：在 `vnpy_ctastrategy/order_flow/` 下新建 `friction.py`。
-* **内容**：将摩擦拆分为两类独立模型并统一定义返回结构（`SlippageResult`, `CommissionResult`）。
-  1. `BaseSlippageModel`: 仅负责计算市场冲击造成的**价格偏移 (Price Domain)**。
-  2. `BaseCommissionModel`: 仅负责根据规则计算**费用金额 (Cost Domain)**。
+* `PASSIVE_LIMIT`：限价单被动成交（零滑点）。
+* `AGGRESSIVE_LIMIT`：限价单主动穿价（承担滑点）。
+* `STOP_TRIGGERED`：止损单触发（市价滑点）。
+* `MARKET_ORDER`：市价单。
 
-### 🎯 Step 2: 订单类型感知与执行挂载
+**2. 核心数据载体 (Dataclasses)**
 
-* **动作**：改造回测引擎内部的 `cross_limit_order` / `cross_stop_order`。
-* **逻辑**：市价单/止损单强制承受流动性滑点；限价单仅在穿价成交时触发基础滑点（被动吃单滑点强制为 0）。
+* **`ExecutionMatchResult`** (由执行/撮合层统一返回)：
+  * `matched: bool`
+  * `signal_price: float` (意图价：MARKET取开盘/当前，LIMIT取order.price，STOP取触发价)
+  * `match_price: float` (无滑点的理论撮合价)
+  * `volume: float`
+  * `behavior: MatchBehavior`
+  * `reason: str`
+* **`SlippageResult`** (由滑点模型返回)：
+  * `execution_price: float` (加滑点后的真实成交价)
+  * `price_diff: float` (带符号偏移量：执行价 - 撮合价)
+  * `model_name: str`
+* **`CommissionResult`** (由手续费模型返回)：
+  * `commission_amount: float` (绝对金额)
+  * `model_name: str`
 
-### 🎯 Step 3: 审计降维与总账核算 (Ops Layer Accounting)
+**3. 模型接口**
 
-* **动作**：改造 `Tracker` 在 `chain_audit_map` 中的终态归档逻辑。
-* **新增审计核算字段**（数据来源：引擎传入模型结果与透传的 `contract_multiplier`）：
-  * `signal_price`: 意图价格 *(严格定义：MARKET取撮合价/Bar开盘价，LIMIT取order.price，STOP取触发价)*。
-  * `execution_price`: 实际成交价。
-  * `slippage_price_diff`: 单位价格偏移量 *(带符号：`execution_price - signal_price`，保留正负向信息以供审计溯源)*。
-  * `slippage_cost`: 总滑点绝对金额 `= abs(slippage_price_diff) * volume * contract_multiplier`。
-  * `commission_cost`: 总手续费金额。
-  * `total_friction_cost`: 总摩擦损耗金额 `= slippage_cost + commission_cost`。
+* `BaseSlippageModel.calculate(order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult`
+* `BaseCommissionModel.calculate(trade: TradeData, contract_multiplier: float) -> CommissionResult`
 
-### 🎯 Step 4: 报告看板升级
+---
 
-* **动作**：修改 HTML 模板与 `report_builder.py`，透出滑点与手续费分类统计。
+### 📦 施工包 2：执行引擎与撮合重构 (Engine & Matching)
 
-# 🧪 系统验证与验收标准 (System Validation & DoD)
+ **位置** : `vnpy_ctastrategy/backtesting.py`
 
-> **核心原则**：文档定义规则，代码执行验证。不满足当前 DoD 的代码绝对不允许合入主线。
+**1. 双轨切换开关 (`friction_mode`)**
 
-## 🎯 V1.3 & V1.4: Intent-to-Fill & Friction Isolation
+* `BacktestingEngine` 初始化或 `set_parameters` 引入 `friction_mode` 标志位， **默认值为 `"legacy"`** （显式传入 `"v1.4"` 才开启新路径，保障历史脚本零侵入）。
 
-系统必须通过以下 6 项自动化/半自动化验证，否则视作未完成。
+**2. 撮合逻辑下沉与流水线**
+改造 `cross_limit_order` / `cross_stop_order` 内部链路：
 
-### ✅ 验证 1：仓位唯一真相约束 (No Shortcut Constraint)
+1. 引擎调用执行层判定逻辑，获取完整的 `ExecutionMatchResult`。
+2. 引擎调用 `SlippageModel.calculate(...)` 获取 `SlippageResult`。
+3. **关键改价** ：生成 `TradeData`，其 `price` 强制赋值为 `SlippageResult.execution_price`。
+4. 调用 `CommissionModel.calculate(...)` 算手续费。
+5. 将 `TradeData`, `ExecutionMatchResult`, `SlippageResult`, `CommissionResult`, `contract_multiplier` 打包传给 `Tracker` 归档。
 
-* **测试方法**：运行结束后，调用验证脚本对比引擎仓位与流水积分。
-* **通过标准**：
-  * 引擎最终的 `actual_pos`，必须与按合约、开平标识（Direction & Offset）严密推演后的净仓位完全一致。
-  * **计算范式**：必须分离统计 `long_pos` 与 `short_pos`，最后推导 `net_pos = long_pos - short_pos`。
-  * 发现策略绕过管道篡改 `actual_pos` 时，系统在 Validation 阶段必须阻断并抛出 `FATAL`。
+---
 
-### ✅ 验证 2：意图全链路溯源 (Full Pipeline Traceability)
+### 📦 施工包 3：PnL 对齐与换月逻辑隔离 (PnL & Rollover Shim)
 
-* **测试方法**：随机抽取底层回传的任一 `TradeData`。
-* **通过标准**：必须能通过 `vt_orderid` 定位到唯一的 `exec_id`，再向上溯源到原始的 `chain_id` 和 `SignalOrder`。不允许存在无头成交。
+ **位置** : `vnpy_ctastrategy/backtesting.py`
 
-### ✅ 验证 3：风控熔断拦截有效性 (Risk Intercept)
+**1. 换月路径隔离 (Rollover Shim)**
+换月逻辑保持原样，其产生的模拟订单继续调用旧的 `get_slippage(trade, size)` 和 `get_commission()` 接口，绝不走 V1.4 新链路，直至 V1.5 统一处理。
 
-* **测试方法**：开启硬阻断规则触发发单。**过标准**：生成 `REJECTED` 状态日志，订单未发往底层，`actual_pos` 保持不变。
+**2. 杜绝 DailyResult 双重扣费**
+`DailyResult.calculate_pnl` 根据 `friction_mode` 分流：
 
-### ✅ 验证 4：历史策略向下兼容 (Zero-Intrusion)
+* `legacy`: 维持原逻辑 `net_pnl = total_pnl - commission - slippage + rollover_pnl`。
+* `v1.4`: 滑点已含在 `trade.price` 中，改为  **`net_pnl = total_pnl - commission + rollover_pnl`** （彻底摘除 `- slippage`，手续费继续按现金成本扣减）。
 
-* **测试方法**：不做代码修改，直接运行 V1.0 时代的基线策略。
-* **通过标准**：正常发单，回测无报错，且溯源日志生成完备。
+---
 
-### ✅ 验证 5：基于终态转移的审计防爆机制 (Terminal-State Cleanup) 🚨
+### 📦 施工包 4：审计归档与字段语义明确 (Tracker & Semantics)
 
-* **测试方法**：注入包含部分成交、主动撤单、风控拒单的复杂交易流。
-* **通过标准**：
-  * 系统必须实现**基于状态机的生命周期管理**。
-  * 当且仅当一个 `chain_id` 下属的所有订单达到绝对终态（`ALLTRADED`, `CANCELLED`, `REJECTED`），该日志必须被安全落盘归档，并从活跃的 `chain_audit_map` 内存字典中剥离，防止实盘 OOM。
+ **位置** : `vnpy_ctastrategy/order_flow/tracker.py`
 
-### ✅ 验证 6：执行摩擦模块化 (Friction Isolation)
+**1. 字段语义唯一真相表**
 
-* **测试方法**：在不修改策略代码的情况下，动态切换 `Execution Layer` 的滑点模型。
-* **通过标准**：系统 PnL 能够立即反映出不同的摩擦结果，且审计日志中记录了每笔成交承担的“摩擦成本归因”。
+* `signal_price`：策略发单的逻辑意图基准价（来自 `ExecutionMatchResult`）。
+* `match_price`：不考虑流动性的理论成交价（来自 `ExecutionMatchResult`）。
+* `execution_price`：考虑摩擦后的真实物理成交价（等于 `TradeData.price`，来自 `SlippageResult`）。
+
+**2. Tracker 财务核算**
+`record_trade` 接收新对象组。在 `try_archive` 终态时计算：
+
+* `slippage_cost = abs(price_diff) * volume * contract_multiplier`
+* `commission_cost = commission_amount`
+* 写入 `chain_audit_archive` 字典供报告渲染。
+
+**3. 止损单临时审计**
+在 `mark_exempt` 豁免止损单时，必须同步传入并记录摩擦结果（注：V1.5 再将 StopOrder 正式纳入 Pipeline）。
+
+---
+
+### 📦 施工包 5：验收测试设计 (System Validation)
+
+ **位置** : `test/system_validator.py`
+
+合并前必须新增并跑通以下 4 个核心测试：
+
+1. **滑点方向约束测试 (Directional Constraint)** ：
+
+* 买单 (BUY): 断言 `execution_price >= match_price`。
+* 卖单 (SELL/SHORT): 断言 `execution_price <= match_price`。
+* 被动限价 (PASSIVE_LIMIT): 断言 `execution_price == match_price`。
+
+1. **防双重扣费测试 (Double-Deduction Check)** ：
+
+* 构造单笔开平、固定收盘价、无手续费的极简场景， **测试配置中显式关闭换月功能** 。
+* 断言开启滑点前后 `net_pnl` 的差额，严格等于 `Tracker` 中累加的 `sum(slippage_cost)`。
+
+1. **意图价严格性检查 (Signal Price Check)** ：
+
+* 抽查归档记录，断言 `signal_price` 绝不允许为 `0` 或 `None`。
+
+1. **行为判定精准度 (`V14MockStrategy` 场景测试)** ：
+
+* 设定价格诱发穿价 ➡️ 断言生成 `AGGRESSIVE_LIMIT`。
+* 设定价格区间内 ➡️ 断言生成 `PASSIVE_LIMIT`。
+* 设定击穿止损 ➡️ 断言生成 `STOP_TRIGGERED`。
