@@ -30,9 +30,8 @@ from .locale import _
 from .continuous_builder import ContinuousBuilder
 
 # 导入可热插拔的模块接口与 V1 默认实现
-from .backtesting_modules import (BaseMarginModel, BaseSlippageModel, BaseExecutionModel, BaseCommissionModel,
-                                  V1DefaultMarginModel, V1DefaultSlippageModel, V1DefaultExecutionModel,
-                                  V1DefaultCommissionModel)
+from .back_modules import (BaseMarginModel, BaseSlippageModel, BaseExecutionModel, BaseCommissionModel, V1DefaultMarginModel,
+                           V1DefaultSlippageModel, V1DefaultExecutionModel, V1DefaultCommissionModel)
 
 
 class BacktestingEngine:
