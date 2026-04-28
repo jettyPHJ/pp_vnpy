@@ -124,6 +124,11 @@ class BacktestingEngine:
         self.chain_audit_map = self.intent_tracker.chain_audit_map
         self.exempt_trade_records = self.intent_tracker.exempt_trade_records
         self.chain_audit_archive = self.intent_tracker.chain_audit_archive
+        # V1.5 新增：滑动窗口缓存，用于 get_market_context 构造真实上下文
+        from collections import deque
+        self.vol_windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
+        self.tr_windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=14))
+        self.last_closes: dict[str, float] = {}
 
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
@@ -169,6 +174,11 @@ class BacktestingEngine:
         self.chain_audit_map = self.intent_tracker.chain_audit_map
         self.exempt_trade_records = self.intent_tracker.exempt_trade_records
         self.chain_audit_archive = self.intent_tracker.chain_audit_archive
+        # V1.5 重置滑动窗口（clear_data 后重新开始统计）
+        from collections import deque
+        self.vol_windows = defaultdict(lambda: deque(maxlen=20))
+        self.tr_windows = defaultdict(lambda: deque(maxlen=14))
+        self.last_closes = {}
 
     def _normalize_datetime(self, dt) -> datetime:
         """
@@ -990,6 +1000,20 @@ class BacktestingEngine:
         self.strategy.on_bar(bar)
         self.update_daily_close(bar.close_price)
 
+        # V1.5 核心防未来函数：当根 Bar 彻底落定后，才推入历史观察窗口
+        # 此处必须在 on_bar 之后，保证策略调用 send_order 时读到的是上一根 Bar 的统计
+        vt = bar.vt_symbol
+        self.vol_windows[vt].append(bar.volume)
+        last_c = self.last_closes.get(vt)
+        if last_c is not None:
+            tr = max(
+                bar.high_price - bar.low_price,
+                abs(bar.high_price - last_c),
+                abs(bar.low_price - last_c),
+            )
+            self.tr_windows[vt].append(tr)
+        self.last_closes[vt] = bar.close_price
+
     def new_tick(self, tick: TickData) -> None:
         self.tick = tick
         self.datetime = tick.datetime
@@ -1044,7 +1068,10 @@ class BacktestingEngine:
                 pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
                 self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
 
-                slip_res = self.slippage_model.calculate_v14(order, match_res, self.size)
+                # V1.5：注入真实市场上下文，启用 calculate 统一接口
+                _vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
+                _ctx = self.get_market_context(_vt_sym)
+                slip_res = self.slippage_model.calculate(order, match_res, self.size, _ctx)
                 trade: TradeData = TradeData(
                     symbol=order.symbol,
                     exchange=order.exchange,
@@ -1325,18 +1352,27 @@ class BacktestingEngine:
         target_vt_symbol = self._normalize_vt_symbol(target_vt_symbol)
         contract = self._get_backtest_contract(target_vt_symbol)
 
-        signal, risk_order, execution = self.order_pipeline.process_signal(strategy.strategy_name,
-                                                                           target_vt_symbol,
-                                                                           direction,
-                                                                           offset,
-                                                                           price,
-                                                                           volume,
-                                                                           lock,
-                                                                           net,
-                                                                           contract,
-                                                                           created_at=self.datetime)
+        # V1.5：抓取上下文与账户快照，供上下文感知型风控管理器使用
+        context = self.get_market_context(target_vt_symbol)
+        snapshot = self.get_account_snapshot()
 
-        if risk_order.decision != RiskDecision.PASS:
+        signal, risk_order, execution = self.order_pipeline.process_signal(
+            strategy.strategy_name,
+            target_vt_symbol,
+            direction,
+            offset,
+            price,
+            volume,
+            lock,
+            net,
+            contract,
+            created_at=self.datetime,
+            context=context,
+            snapshot=snapshot,
+        )
+
+        # V1.5 致命级修复：精准截杀 REJECT，SHRINK（手数裁剪）与 PASS 均放行
+        if risk_order.decision == RiskDecision.REJECT:
             self.output(f"[RISK_REJECT] {signal.chain_id}: {risk_order.reject_reason}")
             return []
 
@@ -1512,6 +1548,42 @@ class BacktestingEngine:
 
     def get_all_stop_orders(self) -> list:
         return list(self.stop_order_history.values())
+
+    # ------------------------------------------------------------------
+    # V1.5 新增：上下文与快照工厂方法，供 send_order 透传给流水线
+    # ------------------------------------------------------------------
+
+    def calculate_occupied_margin(self) -> float:
+        """V1.5 MVP：暂不实现复杂资金占用，返回 0 保证回测不中断。"""
+        return 0.0
+
+    def get_market_context(self, vt_symbol: str):
+        """
+        构造当前 Bar 的市场上下文（V1.5 真实滑动窗口实现）。
+        - is_ready=True：窗口填满后激活容量裁剪
+        - is_ready=False：暖机期安全兜底，跳过容量裁剪
+        """
+        from .order_flow.models import MarketContext
+        import numpy as np
+
+        vol_q = self.vol_windows[vt_symbol]
+        tr_q = self.tr_windows[vt_symbol]
+
+        is_ready = (len(vol_q) == vol_q.maxlen) and (vol_q.maxlen > 0)
+        ref_vol = float(np.mean(vol_q)) if vol_q else 1.0
+        atr = float(np.mean(tr_q)) if tr_q else 0.0
+
+        return MarketContext(
+            vt_symbol=vt_symbol,
+            current_atr=atr,
+            reference_volume=ref_vol,
+            is_ready=is_ready,
+        )
+
+    def get_account_snapshot(self):
+        """构造当前账户快照，以初始资金扣除已占用保证金作为可用资金。"""
+        from .order_flow.models import AccountSnapshot
+        return AccountSnapshot(available_cash=self.capital - self.calculate_occupied_margin())
 
 
 class DailyResult:

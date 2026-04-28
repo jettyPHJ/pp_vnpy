@@ -73,25 +73,112 @@ class V1DefaultMarginModel(BaseMarginModel):
 
 
 class V1DefaultSlippageModel(BaseSlippageModel):
-    """V1 默认滑点模型：固定滑点跳数"""
+    """V1 默认滑点模型：固定绝对值滑点"""
 
-    def __init__(self, slippage: float):
+    def __init__(self, slippage: float = 0.0):
         self.slippage = slippage
 
     def get_slippage(self, trade: TradeData, size: float) -> float:
         return trade.volume * size * self.slippage
 
-    def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
-        """V1.4: embed slippage into the execution price."""
+    def calculate(self, order, match_result: ExecutionMatchResult, contract_multiplier: float, context=None) -> SlippageResult:
+        """
+        V1.5 新增：供新版撮合路径调用的统一接口，携带可选 context 参数预留扩展。
+        被动限价单（PASSIVE_LIMIT）不产生额外滑点。
+        """
         if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
             return SlippageResult(match_result.match_price, 0.0, "V1_Default_Slippage")
 
-        execution_price = match_result.match_price + (self.slippage if order.direction == Direction.LONG else -self.slippage)
+        exec_price = match_result.match_price + (
+            self.slippage if order.direction == Direction.LONG else -self.slippage
+        )
+        return SlippageResult(exec_price, self.slippage, "V1_Default_Slippage")
+
+    def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
+        """
+        兼容保留：供 V1.4 遗留的 cross_limit_order 调用。
+        待 V1.6 彻底重构撮合层时退役。
+        """
+        if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
+            return SlippageResult(match_result.match_price, 0.0, "V1_Default_Slippage")
+
+        execution_price = match_result.match_price + (
+            self.slippage if order.direction == Direction.LONG else -self.slippage
+        )
         return SlippageResult(
             execution_price=execution_price,
             price_diff=execution_price - match_result.match_price,
             model_name="V1_Default_Slippage",
         )
+
+
+class FixedTickSlippageModel(BaseSlippageModel):
+    """
+    V1.5 新增：固定 N 跳滑点模型。
+    滑点 = fixed_ticks × pricetick，方向感知。
+    """
+
+    def __init__(self, fixed_ticks: float = 1.0):
+        self.fixed_ticks = fixed_ticks
+
+    def get_slippage(self, trade: TradeData, size: float) -> float:
+        # 此处 pricetick 信息需从外部传入，get_slippage 接口暂不支持；
+        # 实际成本计算建议走 calculate / calculate_v14。
+        return 0.0
+
+    def calculate(self, order, match_result: ExecutionMatchResult, contract_multiplier: float, context=None) -> SlippageResult:
+        if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
+            return SlippageResult(match_result.match_price, 0.0, "FixedTick")
+
+        # 安全防线：order 若为原生 OrderData 无 pricetick 属性，则回退到 1.0
+        pricetick = getattr(order, "pricetick", 1.0)
+        price_diff = self.fixed_ticks * pricetick
+        exec_price = match_result.match_price + (
+            price_diff if order.direction == Direction.LONG else -price_diff
+        )
+        return SlippageResult(exec_price, price_diff, "FixedTick")
+
+    def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
+        """兼容 V1.4 撮合调用路径。"""
+        return self.calculate(order, match_result, contract_multiplier)
+
+
+class VolumeImpactSlippageModel(BaseSlippageModel):
+    """
+    V1.5 容量感知滑点：Almgren-Chriss 简化冲击模型。
+    price_diff = impact_factor × sqrt(volume / reference_volume) × pricetick
+    - reference_volume 来自 MarketContext（滑动均量），防止量纲失真
+    - pricetick 确保冲击以价格单位计算
+    - PASSIVE_LIMIT 不产生额外滑点
+    """
+
+    def __init__(self, impact_factor: float = 1.0):
+        import math
+        self._sqrt = math.sqrt
+        self.impact_factor = impact_factor
+
+    def get_slippage(self, trade: TradeData, size: float) -> float:
+        # get_slippage 接口无法获取 reference_volume，不在此路径计算
+        return 0.0
+
+    def calculate(self, order, match_result: ExecutionMatchResult, contract_multiplier: float, context=None) -> SlippageResult:
+        if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
+            return SlippageResult(match_result.match_price, 0.0, "VolumeImpact")
+
+        # 从上下文提取参考均量，防零除；无上下文时退化为 1 手均量
+        ref_vol   = max(context.reference_volume, 1e-8) if context else 1.0
+        # 从 order 提取 pricetick，兼容 ExecutionOrder 与原生 OrderData
+        pricetick = getattr(order, "pricetick", 1.0)
+
+        price_diff = self.impact_factor * self._sqrt(match_result.volume / ref_vol) * pricetick
+        exec_price = match_result.match_price + (
+            price_diff if order.direction == Direction.LONG else -price_diff
+        )
+        return SlippageResult(exec_price, price_diff, "VolumeImpact")
+
+    def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
+        # V1.4 兼容路径：无上下文，退化计算（量纲无法保证，仅用于遗留测试）
+        return self.calculate(order, match_result, contract_multiplier, context=None)
 
 
 class V1DefaultCommissionModel(BaseCommissionModel):
@@ -103,10 +190,8 @@ class V1DefaultCommissionModel(BaseCommissionModel):
 
     def get_commission(self, trade: TradeData, size: float) -> float:
         if self.by_volume:
-            # 按手数收费 (例如：1.2元/手)
             return trade.volume * self.rate
         else:
-            # 按成交额比例收费 (例如：万分之一)
             turnover = trade.volume * size * trade.price
             return turnover * self.rate
 

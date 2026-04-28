@@ -1,6 +1,8 @@
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Optional
+
 from vnpy.trader.constant import Direction, Offset
 
 
@@ -11,13 +13,37 @@ class OrderSource(Enum):
 class RiskDecision(Enum):
     PASS = "PASS"
     REJECT = "REJECT"
+    SHRINK = "SHRINK"          # V1.5 新增：风控裁剪后放行
 
 
 class ConstraintType(Enum):
     NONE = "NONE"
     HARD_LIMIT = "HARD_LIMIT"
     RATE_LIMIT = "RATE_LIMIT"
+    CAPITAL = "CAPITAL"        # V1.5 新增：资金不足
+    SIZE = "SIZE"              # V1.5 新增：手数裁剪/取整为0
 
+
+# ---------------------------------------------------------------------------
+# V1.5 新增：市场上下文与账户快照，供上下文感知型风控管理器使用
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MarketContext:
+    vt_symbol: str
+    current_atr: float = 0.0
+    reference_volume: float = 0.0
+    is_ready: bool = False      # False 时跳过容量裁剪，避免暖机期误杀
+
+
+@dataclass
+class AccountSnapshot:
+    available_cash: float
+
+
+# ---------------------------------------------------------------------------
+# 核心数据模型
+# ---------------------------------------------------------------------------
 
 @dataclass
 class SignalOrder:
@@ -40,6 +66,9 @@ class RiskOrder:
     decision: RiskDecision
     constraint_type: ConstraintType
     reject_reason: str = ""
+    # V1.5 新增：使用 Optional + None 哨兵，防止下游取 0 造成静默失效
+    original_volume: Optional[float] = None
+    adjusted_volume: Optional[float] = None
     processed_at: datetime = field(default_factory=datetime.now)
 
 
