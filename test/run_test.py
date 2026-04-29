@@ -11,16 +11,17 @@ if project_root not in sys.path:
 import config as cfg
 from vnpy_ctastrategy.backtesting import BacktestingEngine
 from report_builder import generate_web_report
+from system_validator import run_all_system_validations
 
 from vnpy.trader.object import HistoryRequest
 from vnpy.trader.datafeed import get_datafeed
 from vnpy.trader.database import get_database
 from vnpy.trader.constant import Exchange
-from system_validator import run_all_system_validations
 from vnpy_ctastrategy.strategies.v13_mock_strategy import V13MockStrategy
+from vnpy_ctastrategy.base import ExecutionProfile
 
 
-def download_data(route: dict) -> None:
+def download_data(route: dict = None) -> None:
     """根据配置同步历史数据。
     对当前连续合约框架，只强制下载物理合约数据；
     连续符号 rb888.SHFE 由 ContinuousBuilder 在引擎内部拼接，不依赖数据源直接提供。
@@ -55,41 +56,30 @@ def download_data(route: dict) -> None:
     print("=" * 60)
 
 
-def run_main() -> None:
-    # 1. 当前策略路由
-    route = cfg.STRATEGY_ROUTES[cfg.CURRENT_STRATEGY]
-    strategy_class_name = cfg.CURRENT_STRATEGY.value
-
-    # 2. 自动下载物理合约数据
-    if cfg.AUTO_DOWNLOAD:
-        download_data(route)
-
-    # 3. 动态导入策略
-    module = importlib.import_module(route["module_path"])
-    strategy_class = getattr(module, strategy_class_name)
-
-    # 4. 初始化引擎
+def run_backtest_with_config(strategy_class, setting: dict, vt_symbol: str):
     engine = BacktestingEngine()
-    engine.set_parameters(
-        vt_symbol=route["vt_symbol"],
-        interval=cfg.INTERVAL,
-        start=cfg.START_DATE,
-        end=cfg.END_DATE,
-        rate=cfg.RATE,
-        slippage=cfg.SLIPPAGE,
-        size=cfg.SIZE,
-        pricetick=cfg.PRICETICK,
-        capital=cfg.CAPITAL,
-        mode=cfg.MODE,
-        physical_symbols=cfg.PHYSICAL_SYMBOLS,
-        by_volume=cfg.BY_VOLUME,
-        warmup_days=cfg.WARMUP_DAYS,
-        friction_mode="v1.4",
-    )
 
-    # 5. 执行回测
-    # engine.add_strategy(strategy_class, route["parameters"])
-    engine.add_strategy(V13MockStrategy, {})
+    # 🚨 修复点：vt_symbol 改为由参数传入，不再从全局 cfg 获取
+    engine.set_parameters(vt_symbol=vt_symbol,
+                          interval=cfg.INTERVAL,
+                          start=cfg.START_DATE,
+                          end=cfg.END_DATE,
+                          rate=cfg.RATE,
+                          slippage=cfg.SLIPPAGE,
+                          size=cfg.SIZE,
+                          pricetick=cfg.PRICETICK,
+                          capital=cfg.CAPITAL,
+                          physical_symbols=cfg.PHYSICAL_SYMBOLS,
+                          warmup_days=cfg.WARMUP_DAYS)
+
+    # 2. 配置物理仿真执行环境
+    engine.configure_execution(profile=ExecutionProfile.REALISTIC,
+                               margin_rate=0.10,
+                               max_order_size=50.0,
+                               max_participation_rate=0.15,
+                               impact_factor=1.5)
+
+    engine.add_strategy(strategy_class, setting)
     engine.load_data()
 
     # 数据加载失败拦截
@@ -106,13 +96,25 @@ def run_main() -> None:
         print(f"❌ 回测执行过程中发生异常: {error_msg}。拒绝生成残缺报表！")
         sys.exit(1)
 
+    # ── 架构级系统验证（V1.3 ~ V1.5 全量防回退测试）────────────────────────
+    # 必须在 calculate_result() 之前执行，此时引擎交易数据最完整。
+    # 传入 engine 实例，V1.3/V1.4 验证器才能拿到真实的 trades / chain_audit_archive。
+    print("\n" + "─" * 60)
+    print("🔍 回测完成，开始执行架构级系统验证...")
+    print("─" * 60)
+    try:
+        run_all_system_validations(engine)
+    except AssertionError as e:
+        print(f"\n🚨 系统验证失败！请立即修复后再生成报表：\n   {e}")
+        sys.exit(2)
+    except Exception as e:
+        print(f"\n⚠️ 系统验证发生意外异常（非断言）：{e}")
+        # 非预期异常打印后继续生成报表，方便调试
+    print("─" * 60 + "\n")
+
     # 6. 计算结果并生成报告
     df = engine.calculate_result()
     stats = engine.calculate_statistics()
-
-    print("\n" + "=" * 50)
-    run_all_system_validations(engine)
-    print("=" * 50 + "\n")
 
     # 报告输出目录：相对于本脚本所在的 test/ 文件夹
     result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")
@@ -122,4 +124,27 @@ def run_main() -> None:
 
 
 if __name__ == "__main__":
-    run_main()
+    # 1. 提取当前策略配置枚举
+    current_strategy_enum = getattr(cfg, "CURRENT_STRATEGY", None)
+
+    # 2. 动态路由解析策略类、配置参数和标的合约
+    if current_strategy_enum and hasattr(cfg, "STRATEGY_ROUTES") and current_strategy_enum in cfg.STRATEGY_ROUTES:
+        route = cfg.STRATEGY_ROUTES[current_strategy_enum]
+
+        # 动态导入模块与类
+        module = importlib.import_module(route["module_path"])
+        strategy_class = getattr(module, current_strategy_enum.value)
+
+        # 提取参数
+        setting = route.get("parameters", {})
+        target_vt_symbol = route.get("vt_symbol", "rb888.SHFE")
+    else:
+        # 降级兜底方案
+        strategy_class = V13MockStrategy
+        setting = {}
+        target_vt_symbol = "rb888.SHFE"
+
+    print(f"▶️ 当前执行策略: {strategy_class.__name__} | 标的合约: {target_vt_symbol}")
+
+    # 3. 传入正确的类、参数和标的启动回测
+    run_backtest_with_config(strategy_class, setting, target_vt_symbol)

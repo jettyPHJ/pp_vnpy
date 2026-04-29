@@ -33,6 +33,10 @@ from .continuous_builder import ContinuousBuilder
 from .back_modules import (BaseMarginModel, BaseSlippageModel, BaseExecutionModel, BaseCommissionModel, V1DefaultMarginModel,
                            V1DefaultSlippageModel, V1DefaultExecutionModel, V1DefaultCommissionModel)
 
+from vnpy_ctastrategy.base import ExecutionProfile
+from vnpy_ctastrategy.back_modules import VolumeImpactSlippageModel
+from vnpy_ctastrategy.order_flow.pipeline_stubs import CapitalAndSizeRiskManager, DummyRiskManager
+
 
 class BacktestingEngine:
     """"""
@@ -990,6 +994,49 @@ class BacktestingEngine:
             })
             raise
 
+    def configure_execution(
+        self,
+        profile: ExecutionProfile = ExecutionProfile.REALISTIC,
+        margin_rate: float = 0.10,
+        max_order_size: float = 50.0,
+        max_participation_rate: float = 0.15,
+        impact_factor: float = 1.5,
+    ):
+        """配置业务级执行环境"""
+        if not getattr(self, "vt_symbol", ""):
+            raise RuntimeError("⚠️ 引擎尚未初始化，请务必在 set_parameters() 之后调用 configure_execution()。")
+        if not hasattr(self, "order_pipeline"):
+            raise RuntimeError("⚠️ 审计管道未就绪，请检查 BacktestingEngine.__init__ 是否正确执行。")
+
+        self.execution_profile = profile
+
+        self.output("-" * 50)
+        self.output(f"⚙️ Execution Profile: {profile.name}")
+
+        if profile == ExecutionProfile.REALISTIC:
+            self.friction_mode = "v1.4"
+            self.slippage_model = VolumeImpactSlippageModel(impact_factor=impact_factor)
+            self.order_pipeline.risk_manager = CapitalAndSizeRiskManager(margin_rate=margin_rate,
+                                                                         max_order_size=max_order_size,
+                                                                         max_participation_rate=max_participation_rate)
+            self.output(f"   - Capital Constraint: Enabled ({margin_rate * 100}%)")
+            self.output(f"   - Participation Limit: Enabled ({max_participation_rate * 100}%)")
+            self.output(f"   - Dynamic Slippage: Enabled (Impact {impact_factor})")
+            self.output(f"   - Stop Order Pipeline: Enabled (Strict Auditing)")
+
+        elif profile == ExecutionProfile.STANDARD:
+            self.friction_mode = "v1.4"
+            self.order_pipeline.risk_manager = DummyRiskManager()
+            self.output(f"   - Base Pipeline: Enabled (V1.4 Routing)")
+            self.output(f"   - Risk/Capacity Constraints: Disabled")
+
+        else:
+            self.friction_mode = "legacy"
+            self.order_pipeline.risk_manager = DummyRiskManager()
+            self.output(f"   - Mode: Native unconstrained simulation")
+
+        self.output("-" * 50)
+
     def new_bar(self, bar: BarData) -> None:
         self.bar = bar
         self.datetime = bar.datetime
@@ -1000,8 +1047,9 @@ class BacktestingEngine:
         self.strategy.on_bar(bar)
         self.update_daily_close(bar.close_price)
 
-        # V1.5 核心防未来函数：当根 Bar 彻底落定后，才推入历史观察窗口
-        # 此处必须在 on_bar 之后，保证策略调用 send_order 时读到的是上一根 Bar 的统计
+        # ==============================================================
+        # V1.5 修复：同时维护“连续合约”和“物理合约”的双轨容量观察窗口
+        # ==============================================================
         vt = bar.vt_symbol
         self.vol_windows[vt].append(bar.volume)
         last_c = self.last_closes.get(vt)
@@ -1013,6 +1061,23 @@ class BacktestingEngine:
             )
             self.tr_windows[vt].append(tr)
         self.last_closes[vt] = bar.close_price
+
+        # 同步当前主力物理合约的 K线数据到对应的滑动窗口
+        if self.current_physical_symbol:
+            lookup_dt = self._normalize_lookup_dt(self.datetime)
+            phys_bar = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
+            if phys_bar:
+                phys_vt = self.current_physical_symbol
+                self.vol_windows[phys_vt].append(phys_bar.volume)
+                last_phys_c = self.last_closes.get(phys_vt)
+                if last_phys_c is not None:
+                    tr_phys = max(
+                        phys_bar.high_price - phys_bar.low_price,
+                        abs(phys_bar.high_price - last_phys_c),
+                        abs(phys_bar.low_price - last_phys_c),
+                    )
+                    self.tr_windows[phys_vt].append(tr_phys)
+                self.last_closes[phys_vt] = phys_bar.close_price
 
     def new_tick(self, tick: TickData) -> None:
         self.tick = tick
@@ -1165,14 +1230,156 @@ class BacktestingEngine:
             lookup_dt = self._normalize_lookup_dt(self.datetime)
             if self.current_physical_symbol:
                 current_data = self.physical_bars.get((self.current_physical_symbol, lookup_dt))
-                if not current_data:
-                    return
+                if not current_data: return
             else:
                 current_data = self.bar
         else:
             current_data = self.tick
 
         for stop_order in list(self.active_stop_orders.values()):
+
+            if self.mode == BacktestingMode.BAR:
+                long_cross = stop_order.direction == Direction.LONG and current_data.high_price >= stop_order.price
+                short_cross = stop_order.direction == Direction.SHORT and current_data.low_price <= stop_order.price
+            else:
+                long_cross = stop_order.direction == Direction.LONG and current_data.last_price >= stop_order.price
+                short_cross = stop_order.direction == Direction.SHORT and current_data.last_price <= stop_order.price
+
+            if not (long_cross or short_cross):
+                continue
+
+            # =======================================================
+            # 🛡️ V1.5 REALISTIC 硬核管控分支
+            # =======================================================
+            if getattr(self, "execution_profile", ExecutionProfile.LEGACY) == ExecutionProfile.REALISTIC:
+                from vnpy_ctastrategy.order_flow.models import RiskDecision
+
+                context = self.get_market_context(stop_order.vt_symbol)
+                snapshot = self.get_account_snapshot()
+                contract = self._get_backtest_contract(stop_order.vt_symbol)
+                contract_multiplier = getattr(contract, "multiplier", getattr(contract, "size", self.size))
+
+                signal, risk_order, execution = self.order_pipeline.process_signal(strategy_name=stop_order.strategy_name,
+                                                                                   vt_symbol=stop_order.vt_symbol,
+                                                                                   direction=stop_order.direction,
+                                                                                   offset=stop_order.offset,
+                                                                                   price=stop_order.price,
+                                                                                   volume=stop_order.volume,
+                                                                                   lock=stop_order.lock,
+                                                                                   net=stop_order.net,
+                                                                                   contract=contract,
+                                                                                   created_at=self.datetime,
+                                                                                   context=context,
+                                                                                   snapshot=snapshot)
+                signal.reference = f"STOP_TRIGGER_{stop_order.stop_orderid}"
+
+                actual_volume = risk_order.adjusted_volume
+
+                if risk_order.decision == RiskDecision.REJECT or actual_volume <= 0:
+                    stop_order.status = StopOrderStatus.CANCELLED
+                    stop_order.cancel_reason = risk_order.reject_reason or "资金/容量被风控硬拦截"
+                    self.output(f"⚠️ [硬核风控] 止损单 {stop_order.stop_orderid} 触发被拦截: {stop_order.cancel_reason}")
+                    self._record_stop_order_history(stop_order)
+                    self._call_strategy_on_stop_order(stop_order)
+                    self.active_stop_orders.pop(stop_order.stop_orderid)
+                    continue
+
+                if actual_volume < stop_order.volume:
+                    self.output(f"⚠️ [容量裁剪] 止损单 {stop_order.stop_orderid} (目标 {stop_order.volume}) 仅成交 {actual_volume} 手，余量作废。")
+                    stop_order.shrink_reason = "STOP_SHRINK_REMAINDER_DROPPED"
+                    stop_order.original_volume = stop_order.volume
+                    stop_order.executed_volume = actual_volume
+
+                stop_order.status = StopOrderStatus.TRIGGERED
+
+                self.limit_order_count += 1
+                target_symbol, target_exchange_str = self._normalize_vt_symbol(stop_order.vt_symbol).split(".")
+
+                order = OrderData(symbol=target_symbol,
+                                  exchange=Exchange(target_exchange_str),
+                                  orderid=str(self.limit_order_count),
+                                  direction=stop_order.direction,
+                                  offset=stop_order.offset,
+                                  price=stop_order.price,
+                                  volume=actual_volume,
+                                  traded=actual_volume,
+                                  status=Status.ALLTRADED,
+                                  gateway_name=self.gateway_name,
+                                  datetime=self.datetime)
+                order_offset = getattr(stop_order, "price_offset", 0.0)
+                order.accounting_price = stop_order.price
+                order.physical_price = stop_order.price
+                order.price_offset = order_offset
+
+                self.limit_orders[order.vt_orderid] = order
+                self._record_limit_order_history(order)
+
+                self.intent_tracker.bind_order(order.vt_orderid, signal.chain_id, execution.exec_id, actual_volume)
+
+                # 补全 physical_positions 的记录更新
+                vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
+                pos_change = actual_volume if order.direction == Direction.LONG else -actual_volume
+                self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
+
+                if self.mode == BacktestingMode.TICK:
+                    match_price = current_data.last_price
+                else:
+                    match_price = max(stop_order.price, current_data.open_price) if long_cross else min(
+                        stop_order.price, current_data.open_price)
+
+                from vnpy_ctastrategy.order_flow.friction import ExecutionMatchResult, MatchBehavior
+                match_res = ExecutionMatchResult(True, stop_order.price, match_price, actual_volume,
+                                                 MatchBehavior.STOP_TRIGGERED)
+
+                slip_res = self.slippage_model.calculate(signal, match_res, contract_multiplier, context)
+                execution_price = slip_res.execution_price
+
+                self.trade_count += 1
+                trade = TradeData(symbol=order.symbol,
+                                  exchange=order.exchange,
+                                  orderid=order.orderid,
+                                  tradeid=str(self.trade_count),
+                                  direction=order.direction,
+                                  offset=order.offset,
+                                  price=execution_price,
+                                  volume=actual_volume,
+                                  datetime=self.datetime,
+                                  gateway_name=self.gateway_name)
+                trade.accounting_price = execution_price + order_offset
+                trade.physical_price = execution_price
+                trade.price_offset = order_offset
+
+                comm_res = self.commission_model.calculate_v14(trade, contract_multiplier)
+
+                self.trade_friction_map[trade.vt_tradeid] = {
+                    "slippage_cost": abs(slip_res.price_diff) * actual_volume * contract_multiplier,
+                    "commission_cost": comm_res.commission_amount,
+                    "match_result": match_res,
+                    "slippage_result": slip_res,
+                    "commission_result": comm_res,
+                }
+
+                stop_order.vt_orderids.append(order.vt_orderid)
+                self._record_stop_order_history(stop_order)
+                self.active_stop_orders.pop(stop_order.stop_orderid, None)
+
+                self._call_strategy_on_stop_order(stop_order)
+                self._call_strategy_on_order(order)
+
+                self.intent_tracker.record_trade(trade,
+                                                 match_result=match_res,
+                                                 slippage_result=slip_res,
+                                                 commission_result=comm_res,
+                                                 contract_multiplier=contract_multiplier)
+                self.strategy.pos = self.position_ledger.apply_trade(trade)
+                self._call_strategy_on_trade(trade)
+                self.trades[trade.vt_tradeid] = trade
+
+                continue
+
+            # =======================================================
+            # 🛡️ LEGACY / STANDARD 分支
+            # =======================================================
             if getattr(self, "friction_mode", "legacy") == "v1.4":
                 match_res = self.execution_model.match_stop_order_v14(stop_order, current_data)
                 trade_price, trade_volume = match_res.match_price, match_res.volume
@@ -1188,7 +1395,6 @@ class BacktestingEngine:
             target_vt_symbol = self._normalize_vt_symbol(stop_order.vt_symbol)
             target_symbol, target_exchange_str = target_vt_symbol.split(".")
 
-            # 注：V1 止损单触发即全额成交，V2 部分成交模型需扩展此处状态机
             order: OrderData = OrderData(symbol=target_symbol,
                                          exchange=Exchange(target_exchange_str),
                                          orderid=str(self.limit_order_count),
@@ -1206,7 +1412,6 @@ class BacktestingEngine:
             order.physical_price = stop_order.price
             order.price_offset = order_offset
 
-            # [修复] 资金检查失败时的异常快照录入
             if not self.margin_model.check_margin(order, self):
                 self.output(_("[{}] ⚠️ 止损单触发被拒：资金/保证金不足 - {}").format(self.datetime, order.vt_symbol))
                 stop_order.status = StopOrderStatus.CANCELLED
@@ -1219,7 +1424,7 @@ class BacktestingEngine:
                 continue
 
             self.limit_orders[order.vt_orderid] = order
-            self._record_limit_order_history(order)  # 转化出来的限价单也要入账
+            self._record_limit_order_history(order)
             self.trade_count += 1
 
             vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
@@ -1268,7 +1473,7 @@ class BacktestingEngine:
 
             self._call_strategy_on_stop_order(stop_order)
             self._call_strategy_on_order(order)
-            # 记录打标，并使用账本更新止损单的仓位
+
             if getattr(self, "friction_mode", "legacy") == "v1.4":
                 self.intent_tracker.record_standalone_trade(
                     trade,
@@ -1280,8 +1485,8 @@ class BacktestingEngine:
                 )
             else:
                 self.intent_tracker.mark_exempt(trade, reason="STOP_ORDER_TRIGGERED")
-            self.strategy.pos = self.position_ledger.apply_trade(trade)
 
+            self.strategy.pos = self.position_ledger.apply_trade(trade)
             self._call_strategy_on_trade(trade)
             self.trades[trade.vt_tradeid] = trade
 

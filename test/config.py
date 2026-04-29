@@ -40,14 +40,33 @@ PHYSICAL_SYMBOLS = [
 class StrategyMode(Enum):
     DONCHIAN = "DonchianChannelStrategy"  # 唐奇安通道策略
     TEST_HOLD = "TestRolloverStrategy"  # 换月死扛测试策略
+    STRESS_TEST = "PipelineStressTestStrategy"  # 端到端管道全量压测策略
 
 
 # 🔴 在这里切换你要运行的策略
-CURRENT_STRATEGY = StrategyMode.TEST_HOLD
+# STRESS_TEST：专用压测，系统性触发 AGGRESSIVE/PASSIVE/STOP/SHRINK/REJECT 全部节点
+# DONCHIAN   ：唐奇安通道，真实投研用途，仅产生 STOP_TRIGGERED
+# TEST_HOLD  ：换月死扛，极简测试，几乎不交易
+CURRENT_STRATEGY = StrategyMode.STRESS_TEST
 
 # ==============================================================
 # 3. 🎯 各策略独立配置区
 # ==============================================================
+
+# --- 策略 3: 端到端管道全量压测 ---
+# 专为触发 V1.3~V1.5 所有验证器设计：
+#   - AGGRESSIVE_LIMIT (buy & short 各一次)
+#   - PASSIVE_LIMIT    (低价挂单等触发)
+#   - STOP_TRIGGERED   (多空各一次止损单)
+#   - SHRINK           (200手→容量裁剪)
+#   - REJECT           (MALICIOUS_TEST关键字硬拒)
+STRESS_TEST_CONFIG = {
+    "module_path": "vnpy_ctastrategy.strategies.pipeline_stress_test_strategy",
+    "vt_symbol": "rb888.SHFE",
+    "parameters": {
+        "fixed_size": 1
+    }
+}
 
 # --- 策略 1: 唐奇安通道 ---
 DONCHIAN_CONFIG = {
@@ -73,6 +92,7 @@ TEST_HOLD_CONFIG = {
 STRATEGY_ROUTES = {
     StrategyMode.DONCHIAN: DONCHIAN_CONFIG,
     StrategyMode.TEST_HOLD: TEST_HOLD_CONFIG,
+    StrategyMode.STRESS_TEST: STRESS_TEST_CONFIG,
 }
 
 

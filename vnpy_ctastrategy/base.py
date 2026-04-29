@@ -1,7 +1,3 @@
-"""
-Defines constants and objects used in CtaStrategy App.
-"""
-
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timedelta
@@ -25,6 +21,12 @@ class EngineType(Enum):
     BACKTESTING = _("回测")
 
 
+class ExecutionProfile(Enum):
+    LEGACY = "legacy"
+    STANDARD = "standard"
+    REALISTIC = "realistic"
+
+
 class BacktestingMode(Enum):
     BAR = 1
     TICK = 2
@@ -44,9 +46,12 @@ class StopOrder:
     net: bool = False
     vt_orderids: list = field(default_factory=list)
     status: StopOrderStatus = StopOrderStatus.WAITING
-    # 👇 V1.1 新增：撤单原因与时间，使用 Any 绕过 Pylance 报错
     cancel_reason: str = ""
     cancel_datetime: Optional[datetime] = None  # type: ignore
+    #  用于报告明确展示容量裁剪余量作废的字段
+    shrink_reason: str = ""
+    original_volume: float = 0.0
+    executed_volume: float = 0.0
 
 
 EVENT_CTA_LOG = "eCtaLog"

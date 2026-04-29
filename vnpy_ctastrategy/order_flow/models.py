@@ -13,27 +13,28 @@ class OrderSource(Enum):
 class RiskDecision(Enum):
     PASS = "PASS"
     REJECT = "REJECT"
-    SHRINK = "SHRINK"          # V1.5 新增：风控裁剪后放行
+    SHRINK = "SHRINK"  # V1.5 新增：风控裁剪后放行
 
 
 class ConstraintType(Enum):
     NONE = "NONE"
     HARD_LIMIT = "HARD_LIMIT"
     RATE_LIMIT = "RATE_LIMIT"
-    CAPITAL = "CAPITAL"        # V1.5 新增：资金不足
-    SIZE = "SIZE"              # V1.5 新增：手数裁剪/取整为0
+    CAPITAL = "CAPITAL"  # V1.5 新增：资金不足
+    SIZE = "SIZE"  # V1.5 新增：手数裁剪/取整为0
 
 
 # ---------------------------------------------------------------------------
 # V1.5 新增：市场上下文与账户快照，供上下文感知型风控管理器使用
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class MarketContext:
     vt_symbol: str
     current_atr: float = 0.0
     reference_volume: float = 0.0
-    is_ready: bool = False      # False 时跳过容量裁剪，避免暖机期误杀
+    is_ready: bool = False  # False 时跳过容量裁剪，避免暖机期误杀
 
 
 @dataclass
@@ -44,6 +45,7 @@ class AccountSnapshot:
 # ---------------------------------------------------------------------------
 # 核心数据模型
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class SignalOrder:
@@ -58,6 +60,7 @@ class SignalOrder:
     lock: bool
     net: bool
     created_at: datetime = field(default_factory=datetime.now)
+    reference: str = ""
 
 
 @dataclass
