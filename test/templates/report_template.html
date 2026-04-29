@@ -18,15 +18,15 @@ document.getElementById("dynamic-style").innerHTML = `{{ STYLE_CONTENT }}`;
 <nav class="sidebar">
     <div class="sidebar-logo">
         <div class="title">CTA REPORT</div>
-        <div class="sub">V1.2.1 · PHASE 1</div>
+        <div class="sub">V1.5 · PHASE 2</div>
     </div>
     <a class="nav-item" href="#qa"><span class="nav-icon">🛡</span>QA 审计</a>
+    <a class="nav-item" href="#health"><span class="nav-icon">🏥</span>执行体检</a>
     <a class="nav-item" href="#mapping"><span class="nav-icon">📐</span>K 线对账</a>
     <a class="nav-item" href="#chart"><span class="nav-icon">📈</span>收益图表</a>
     <a class="nav-item" href="#daily"><span class="nav-icon">📅</span>日度明细</a>
     <a class="nav-item" href="#rollover"><span class="nav-icon">🔄</span>换月审计</a>
-    
-    <a class="nav-item" href="#intent-audit"><span class="nav-icon">🔗</span>意图链路</a>
+    <a class="nav-item" href="#intent-audit"><span class="nav-icon">🚧</span>风控拦截</a>
     <a class="nav-item" href="#orders"><span class="nav-icon">📋</span>订单记录</a>
     <a class="nav-item" href="#trades"><span class="nav-icon">✅</span>成交记录</a>
 </nav>
@@ -34,15 +34,17 @@ document.getElementById("dynamic-style").innerHTML = `{{ STYLE_CONTENT }}`;
 <div class="main">
     <div class="page-header">
         <h1>📊 CTA 回测验真报告</h1>
-        <span class="header-badge">PHASE 1</span>
+        <span class="header-badge">PHASE 2</span>
         <span class="header-ts">{{ TIMESTAMP }}</span>
     </div>
 
     {{ KPI_STRIP }}
+    {{ CONFIG_STRIP }}
 
     <div class="layout-grid">
         <div class="layout-left">
             <div id="qa" data-section="qa">{{ QA_HTML }}</div>
+            <div id="health" data-section="health">{{ HEALTH_PANEL_HTML }}</div>
             <div id="mapping" data-section="mapping">{{ MAPPING_HTML }}</div>
             <div id="chart" class="section-card" data-section="chart">
                 <div class="section-header">
@@ -64,10 +66,10 @@ document.getElementById("dynamic-style").innerHTML = `{{ STYLE_CONTENT }}`;
             </div>
             <div id="intent-audit" class="section-card" data-section="intent-audit">
                 <div class="section-header">
-                    <span class="section-icon">🔗</span>
-                    <span>意图链路审计</span>
-                    <span class="section-sub">Intent-to-Fill Traceability</span>
-                </div>
+                <span class="section-icon">🚧</span>
+                <span>风控拦截与异常意图审计</span>
+                <span class="section-sub">Risk Intercept Traceability</span>
+            </div>
                 <div>{{ INTENT_AUDIT_HTML }}</div>
             </div>
 

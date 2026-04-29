@@ -45,6 +45,14 @@ def _norm_dt(dt):
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 
+def _short_id(x, n=8):
+    """统一的 ID 截断函数，用于 UI 显示"""
+    val = str(x or "")
+    if len(val) > n:
+        return html.escape(val[:n]) + "..."
+    return html.escape(val or "N/A")
+
+
 def _fmt_stat(key, val):
     """按指标类型格式化数值。"""
     PCT_KEYS = {"max_ddpercent", "total_return", "annual_return", "daily_return", "return_std"}
@@ -52,7 +60,7 @@ def _fmt_stat(key, val):
     MONEY_KEYS = {
         "capital", "end_balance", "max_drawdown", "total_net_pnl", "daily_net_pnl", "total_commission", "daily_commission",
         "total_slippage", "daily_slippage", "total_turnover", "daily_turnover", "total_rollover_commission",
-        "total_rollover_slippage", "all_in_commission", "all_in_slippage"
+        "total_rollover_slippage", "all_in_commission", "all_in_slippage", "_gross_pnl"
     }
     try:
         f = float(val)
@@ -88,61 +96,81 @@ def _safe_dt_str(dt, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
 
 
 def _build_intent_audit_table(engine) -> str:
-    """构建 V1.3 意图链路审计表。
-
-    展示顺序调整为 Chain ID -> 信号时间；普通 Pipeline 记录优先使用真实订单时间，
-    避免 SignalOrder.created_at 的机器时间与回测撮合时间不一致。
-    """
     tracker = getattr(engine, "intent_tracker", None)
     if not tracker:
         return "<div class='empty-state'>暂无意图链路记录</div>"
 
     order_dt_map = _build_order_datetime_map(engine)
-    all_records = list(tracker.chain_audit_map.values()) + tracker.chain_audit_archive
+    all_records = list(getattr(tracker, "chain_audit_map", {}).values()) + getattr(tracker, "chain_audit_archive", [])
     rows = ""
 
     for r in all_records:
         sig, risk = r.get("signal"), r.get("risk")
         cid = sig.chain_id if sig else ""
-        cid_display = html.escape(cid) if cid else "N/A"
-        chain_id_attr = f'id="chain-{html.escape(cid)}"' if cid else ""
 
-        if not r.get("orders"):
-            # 风控拒单没有物理订单，使用 SignalOrder.created_at；回测里已由 send_order 注入 self.datetime。
+        cid_display = _short_id(cid)
+
+        decision = getattr(risk, "decision", None) if risk else None
+        decision_name = getattr(decision, "name", "UNKNOWN").upper()
+
+        if decision_name == "PASS":
+            continue
+
+        if decision_name == "REJECT":
             time_str = _safe_dt_str(getattr(sig, "created_at", None))
             reason = getattr(risk, "reject_reason", "RISK_REJECTED") if risk else "UNKNOWN"
-            rows += f"""<tr class="audit-row-reject" {chain_id_attr}>
+            rows += f"""<tr class="audit-row-reject">
                 <td class="mono chain-id-cell">{cid_display}</td>
                 <td class="mono">{time_str}</td>
                 <td>{html.escape(str(sig.direction.value if sig else 'N/A'))}/{html.escape(str(sig.offset.value if sig else 'N/A'))} {getattr(sig, 'volume', 'N/A')}@{getattr(sig, 'price', 'N/A')}</td>
-                <td class="audit-risk-reject">{html.escape(str(risk.decision.value if risk else "N/A"))}</td>
+                <td class="audit-risk-reject">REJECT</td>
                 <td class="mono">[NO_ORDER]</td>
                 <td class="audit-status-reject">Rejected</td>
                 <td class="audit-reason">{html.escape(str(reason))}</td>
             </tr>"""
             continue
 
+        if decision_name == "SHRINK":
+            orig_vol = getattr(sig, 'volume', 'N/A')
+            adj_vol = getattr(risk, 'adjusted_volume', 'N/A')
+            # 渲染缩量摘要行（不 continue，继续渲染落地的子订单）
+            rows += f"""<tr class="audit-row-shrink" style="border-bottom: none;">
+                <td class="mono chain-id-cell">{cid_display}</td>
+                <td class="mono">{_safe_dt_str(getattr(sig, "created_at", None))}</td>
+                <td>{html.escape(str(sig.direction.value if sig else 'N/A'))}/{html.escape(str(sig.offset.value if sig else 'N/A'))} {orig_vol}@{getattr(sig, 'price', 'N/A')}</td>
+                <td class="audit-risk-shrink">SHRINK</td>
+                <td class="mono">[CAPACITY_ADJUST]</td>
+                <td class="audit-status-shrink">Adjusting</td>
+                <td class="audit-reason" style="color:#eab308; font-weight:bold;">
+                    [SIZE_LIMIT] 意图:{orig_vol} ➔ 实际:{adj_vol}
+                </td>
+            </tr>"""
+
+        # 渲染底层落地订单 / 未知状态 fallback
         first_row = True
         for ref in r.get("orders", []):
-            # 普通链路的“信号时间”按真实订单时间展示，保证和订单生命周期表一致。
             time_str = _safe_dt_str(order_dt_map.get(ref.vt_orderid) or ref.updated_at or ref.created_at)
-            status_str = ref.status.value if ref.status else "N/A"
+            status_str = html.escape(str(ref.status.value if ref.status else "N/A"))
             row_id_attr = f'id="chain-{html.escape(cid)}"' if first_row and cid else ""
             first_row = False
             order_id = html.escape(str(ref.vt_orderid)) if ref.vt_orderid else "N/A"
             order_link = f'<a class="chain-anchor" href="#order-{order_id}">{order_id}</a>' if ref.vt_orderid else "N/A"
-            chain_html = f'<a class="chain-anchor" href="#order-{order_id}">{cid_display}</a>' if ref.vt_orderid and cid else cid_display
+            chain_html = f'<a class="chain-anchor" href="#order-{order_id}">↳ {cid_display}</a>' if ref.vt_orderid and cid else cid_display
 
-            rows += f"""<tr class="audit-row-pass" {row_id_attr}>
-                <td class="mono chain-id-cell">{chain_html}</td>
+            risk_css = "audit-risk-shrink" if decision_name == "SHRINK" else "audit-risk-pass"
+            row_class = "audit-row-shrink-child" if decision_name == "SHRINK" else "audit-row-pass"
+
+            rows += f"""<tr class="{row_class}" {row_id_attr}>
+                <td class="mono chain-id-cell" style="padding-left: 20px; color:#94a3b8;">{chain_html}</td>
                 <td class="mono">{time_str}</td>
                 <td>{html.escape(str(sig.direction.value if sig else 'N/A'))}/{html.escape(str(sig.offset.value if sig else 'N/A'))} {getattr(sig, 'volume', 'N/A')}@{getattr(sig, 'price', 'N/A')}</td>
-                <td class="audit-risk-pass">{html.escape(str(risk.decision.value if risk else "N/A"))}</td>
+                <td class="{risk_css}">{decision_name}</td>
                 <td class="mono">{order_link}</td>
-                <td>{html.escape(str(status_str))}</td>
-                <td class="audit-reason">PIPELINE</td>
+                <td class="audit-status-pass">{status_str}</td>
+                <td class="audit-reason">PIPELINE EXECUTED</td>
             </tr>"""
 
+    # 豁免订单(止损单等)保留渲染
     for record in getattr(tracker, "exempt_trade_records", []):
         trade = record["trade"]
         reason = record.get("reason", "STOP_ORDER")
@@ -158,7 +186,7 @@ def _build_intent_audit_table(engine) -> str:
         </tr>"""
 
     if not rows:
-        return "<div class='empty-state'>暂无意图链路记录</div>"
+        return "<div class='empty-state'>暂无意图链路告警或豁免记录</div>"
 
     return f"""<table class='base-table audit-table audit-table-wrap'>
         <thead><tr><th>Chain ID</th><th>信号时间</th><th>意图</th><th>风控</th><th>订单ID</th><th>状态</th><th>备注/来源</th></tr></thead>
@@ -168,79 +196,199 @@ def _build_intent_audit_table(engine) -> str:
 def _build_qa_summary(engine) -> str:
     from vnpy.trader.constant import Status as VnpyStatus
 
+    get_orders_func = getattr(engine, "get_all_orders", None)
+    all_orders = get_orders_func() if callable(get_orders_func) else []
+
+    get_trades_func = getattr(engine, "get_all_trades", None)
+    all_trades = get_trades_func() if callable(get_trades_func) else []
+
+    get_logs_func = getattr(engine, "get_rollover_logs", None)
+    rollover_logs = get_logs_func() if callable(get_logs_func) else getattr(engine, "rollover_logs", [])
+
     on_init_blocked = sum(1 for o in getattr(engine, "warmup_blocked_orders", []) if o.get("phase") == "on_init")
-    on_start_blocked = sum(1 for o in getattr(engine, "warmup_blocked_orders", []) if o.get("phase") == "on_start")
-    mismatch_count = len(getattr(engine, "warmup_interval_mismatch_logs", []))
-
-    audit_logs = getattr(engine, "order_audit_logs", {})
-    rejected_orders = [o for o in engine.get_all_orders() if o.status == VnpyStatus.REJECTED]
-    rejected_missing = [o.vt_orderid for o in rejected_orders if not audit_logs.get(o.vt_orderid, {}).get("status_reason")]
-    cancelled_orders = [o for o in engine.get_all_orders() if o.status == VnpyStatus.CANCELLED]
-    cancelled_missing = [o.vt_orderid for o in cancelled_orders if not audit_logs.get(o.vt_orderid, {}).get("status_reason")]
-
-    norm_start = _norm_dt(engine.start) if hasattr(engine, "start") else None
-    trades_before_start = sum(1 for t in engine.get_all_trades()
-                              if t.datetime and norm_start and _norm_dt(t.datetime) < norm_start)
-
-    rollover_failed = sum(1 for log in getattr(engine, "rollover_logs", []) if log.get("status") == "FAILED")
-    skipped_rollover = len(getattr(engine, "rollover_skip_logs", []))
-
-    raw_rollover_dts = [
-        log.get("datetime") for log in getattr(engine, "rollover_logs", []) if log.get("status") not in ("FAILED", )
-    ]
-    clean_rollover_dts = {_norm_dt(d) for d in raw_rollover_dts if d is not None}
-    missing_dts = []
-    if clean_rollover_dts and hasattr(engine, "history_data"):
-        dt_to_index = {_norm_dt(b.datetime): i for i, b in enumerate(engine.history_data)}
-        for rdt in clean_rollover_dts:
-            if dt_to_index.get(rdt) is None:
-                missing_dts.append(rdt)
-
+    rollover_failed = sum(1 for log in rollover_logs if log.get("status") == "FAILED")
     dl_failed = getattr(engine, "data_load_failed", False)
 
-    def _badge(val, pass_val=0, warn=False):
-        ok = (val == pass_val)
-        if ok:
-            return f"<span class='qa-badge qa-pass'>{val}</span>"
-        elif warn:
-            return f"<span class='qa-badge qa-warn'>{val}</span>"
-        else:
-            return f"<span class='qa-badge qa-fail'>{val}</span>"
+    norm_start = _norm_dt(getattr(engine, "start", None))
+    trades_before_start = sum(1 for t in all_trades if t.datetime and norm_start and _norm_dt(t.datetime) < norm_start)
 
-    dl_badge = ("<span class='qa-badge qa-fail'>FAIL</span>" if dl_failed else "<span class='qa-badge qa-pass'>PASS</span>")
+    audit_logs = getattr(engine, "order_audit_logs", {})
+    rejected_missing = sum(1 for o in all_orders if getattr(o, "status", None) == VnpyStatus.REJECTED
+                           and not audit_logs.get(getattr(o, "vt_orderid", ""), {}).get("status_reason"))
+    cancelled_missing = sum(1 for o in all_orders if getattr(o, "status", None) == VnpyStatus.CANCELLED
+                            and not audit_logs.get(getattr(o, "vt_orderid", ""), {}).get("status_reason"))
+    audit_trail_missing = rejected_missing + cancelled_missing
 
-    items = [
-        ("基础数据加载", "Data Load", dl_badge, "PASS 为通过"),
-        ("初始化非法发单", "on_init Blocked", _badge(on_init_blocked), "0 为 PASS"),
-        ("启动期拦截", "on_start Blocked", _badge(on_start_blocked, warn=True), "仅作参考"),
-        ("回测前成交", "Trades Before Start", _badge(trades_before_start), "0 为 PASS"),
-        ("周期错配预警", "Interval Mismatch", _badge(mismatch_count, warn=True), "大于0提示失真"),
-        ("无原因拒单", "Reject Missing Reason", _badge(len(rejected_missing)), "0 为 PASS"),
-        ("换月崩溃", "Rollover Failed", _badge(rollover_failed), "0 为 PASS"),
-        ("换月缺失K线", "Missing Rollover DTs", _badge(len(missing_dts)), "0 为 PASS"),
-        ("非交易态跳过换月", "Skipped Rollovers", f"<span class='qa-badge qa-muted'>{skipped_rollover}</span>", "仅作参考"),
-        ("无原因撤单", "Cancel Missing Reason", _badge(len(cancelled_missing)), "0 为 PASS"),
-    ]
+    error_count = (1 if dl_failed else 0) + on_init_blocked + trades_before_start + rollover_failed + audit_trail_missing
 
+    # 🟢 无论通过与否，统一生成明细结构
     rows_html = ""
-    for zh, en, badge, criterion in items:
-        rows_html += f"""
-        <tr>
-            <td><span class='qa-label-zh'>{zh}</span><span class='qa-label-en'>{en}</span></td>
-            <td style='text-align:center'>{badge}</td>
-            <td class='qa-criterion'>{criterion}</td>
-        </tr>"""
+    rows_html += f"<tr><td>Data Load 数据加载</td><td><span class='qa-badge {'qa-fail' if dl_failed else 'qa-pass'}'>{'FAIL' if dl_failed else 'PASS'}</span></td><td>底层数据链断裂</td></tr>"
+    rows_html += f"<tr><td>on_init 非法发单</td><td><span class='qa-badge {'qa-fail' if on_init_blocked else 'qa-pass'}'>{on_init_blocked if on_init_blocked else '0'}</span></td><td>策略代码级 Bug</td></tr>"
+    rows_html += f"<tr><td>回测前成交</td><td><span class='qa-badge {'qa-fail' if trades_before_start else 'qa-pass'}'>{trades_before_start if trades_before_start else '0'}</span></td><td>污染初始账本</td></tr>"
+    rows_html += f"<tr><td>换月崩溃</td><td><span class='qa-badge {'qa-fail' if rollover_failed else 'qa-pass'}'>{rollover_failed if rollover_failed else '0'}</span></td><td>连续合约断链</td></tr>"
+    rows_html += f"<tr><td>Audit Trail Missing</td><td><span class='qa-badge {'qa-fail' if audit_trail_missing else 'qa-pass'}'>{audit_trail_missing if audit_trail_missing else '0'}</span></td><td>无原因撤单/拒单</td></tr>"
+
+    is_pass = (error_count == 0)
+    detail_class = "qa-all-pass" if is_pass else "qa-fail-alert"
+    icon = "✅" if is_pass else "🚨"
+    title_text = "引擎核心 QA: 全部通过 (点击查看详情)" if is_pass else "引擎核心 QA: 异常告警 (点击展开详情)"
+    badge_html = f"<span class='qa-badge qa-pass' style='margin-right: 12px;'>0 Exceptions</span>" if is_pass else f"<span class='qa-badge qa-fail' style='margin-right: 12px;'>{error_count} 项异常</span>"
+
+    return f"""
+    <div class="section-card" style="padding: 0; border: none; background: transparent;">
+        <details class="qa-details {detail_class}">
+            <summary>
+                <div style="display:flex; align-items:center;">
+                    <span class="section-icon" style="margin-right:8px;">{icon}</span>
+                    <span>{title_text}</span>
+                </div>
+                {badge_html}
+            </summary>
+            <div class="qa-table-wrap">
+                <table class="base-table qa-table" style="margin: 0; border-radius: 0; border: none;">
+                    <thead><tr><th>检查项</th><th>异常计数</th><th>影响说明</th></tr></thead>
+                    <tbody>{rows_html}</tbody>
+                </table>
+            </div>
+        </details>
+    </div>"""
+
+
+def _aggregate_v15_metrics(engine, stats: dict) -> dict:
+    """提取 V1.5 容量与约束指标 (三层架构标准数据字典)"""
+    metrics = {
+        "capital": {
+            "reject_count": 0
+        },
+        "capacity": {
+            "shrink_count": 0,
+            "total_shrink_pct": 0.0
+        },
+        "execution": {
+            "slippage_ratio": None,
+            "gross_pnl": 0.0
+        }
+    }
+
+    net_pnl = stats.get("total_net_pnl", 0)
+    metrics["execution"]["gross_pnl"] = net_pnl + stats.get("all_in_commission", 0) + stats.get("all_in_slippage", 0)
+
+    if metrics["execution"]["gross_pnl"] > 0:
+        metrics["execution"]["slippage_ratio"] = stats.get("all_in_slippage", 0) / metrics["execution"]["gross_pnl"]
+
+    tracker = getattr(engine, "intent_tracker", None)
+    if tracker:
+        raw_records = list(getattr(tracker, "chain_audit_map", {}).values()) + getattr(tracker, "chain_audit_archive", [])
+
+        dedup_records = {}
+        for i, r in enumerate(raw_records):
+            sig = r.get("signal")
+            key = sig.chain_id if (sig and getattr(sig, "chain_id", None)) else f"fallback_idx_{i}"
+            dedup_records[key] = r
+
+        shrink_sum = 0.0
+        shrink_count = 0
+
+        for r in dedup_records.values():
+            risk = r.get("risk")
+            if not risk: continue
+
+            decision_name = getattr(risk.decision, "name", str(risk.decision)).upper()
+
+            if decision_name == "REJECT":
+                metrics["capital"]["reject_count"] += 1
+            elif decision_name == "SHRINK":
+                metrics["capacity"]["shrink_count"] += 1
+                sig_vol = getattr(r.get("signal"), "volume", 0)
+                adj_vol = getattr(risk, "adjusted_volume", sig_vol)
+
+                if sig_vol > 0 and adj_vol < sig_vol:
+                    shrink_sum += (1 - adj_vol / sig_vol)
+                shrink_count += 1
+
+        if shrink_count > 0:
+            metrics["capacity"]["total_shrink_pct"] = (shrink_sum / shrink_count) * 100
+
+    return metrics
+
+
+def _build_config_strip(engine) -> str:
+    """顶部展示 V1.5 物理回测假设"""
+    slippage_model = None
+    pipeline = getattr(engine, "order_pipeline", None)
+
+    if pipeline:
+        adapter = getattr(pipeline, "execution_adapter", None)
+        if adapter:
+            slippage_model = getattr(adapter, "slippage_model", None)
+
+    if not slippage_model:
+        slippage_model = getattr(engine, "slippage_model", None)
+
+    slippage_cls = slippage_model.__class__.__name__ if slippage_model else "未知/默认模型"
+
+    risk_mgr = getattr(pipeline, "risk_manager", None) if pipeline else None
+    max_vol = getattr(risk_mgr, "max_order_size", "无限制")
+    part_rate = getattr(risk_mgr, "max_participation_rate", "无限制")
+
+    return f"""
+    <div class="config-strip">
+        <span class="config-item">滑点引擎: <span class="config-val">{slippage_cls}</span></span>
+        <span class="config-item">最大单笔规模: <span class="config-val">{max_vol}</span></span>
+        <span class="config-item">容量参与率上限: <span class="config-val">{part_rate}</span></span>
+        <span class="config-item">回测阶段: <span class="config-val">V1.5 容量建模</span></span>
+    </div>"""
+
+
+def _build_health_panel(metrics: dict) -> str:
+    """策略可执行性体检报告"""
+    rej_count = metrics["capital"]["reject_count"]
+    if rej_count > 0:
+        cap_badge = f"<span class='health-badge health-red'>FAIL ({rej_count} 次)</span>"
+        cap_desc = "策略触发资金拦截，资金管理逻辑失效或保证金不足。"
+    else:
+        cap_badge = "<span class='health-badge health-green'>PASS</span>"
+        cap_desc = "未触发资金强制拒单。"
+
+    shrink_count = metrics["capacity"]["shrink_count"]
+    if shrink_count > 0:
+        cap_badge_2 = f"<span class='health-badge health-yellow'>WARN ({shrink_count} 次)</span>"
+        cap_desc_2 = f"触碰规模约束上限，发生订单被动裁剪。平均缩量比例: {metrics['capacity']['total_shrink_pct']:.1f}%"
+    else:
+        cap_badge_2 = "<span class='health-badge health-green'>PASS</span>"
+        cap_desc_2 = "未触发风控规模约束与最大参与率上限。"
+
+    slip_ratio = metrics["execution"]["slippage_ratio"]
+    if slip_ratio is None:
+        exe_badge = "<span class='health-badge health-yellow'>N/A</span>"
+        exe_desc = "策略未产生正向毛收益，无法计算滑点侵蚀率。"
+    else:
+        slip_ratio_pct = slip_ratio * 100
+        if slip_ratio_pct > 20:
+            exe_badge = f"<span class='health-badge health-red'>{slip_ratio_pct:.1f}%</span>"
+            exe_desc = "严重警告：滑点吃掉了超过20%的毛利润，动态冲击成本极高。"
+        elif slip_ratio_pct > 5:
+            exe_badge = f"<span class='health-badge health-yellow'>{slip_ratio_pct:.1f}%</span>"
+            exe_desc = "滑点侵蚀处于正常冲击成本区间。"
+        else:
+            exe_badge = f"<span class='health-badge health-green'>{slip_ratio_pct:.1f}%</span>"
+            exe_desc = "滑点侵蚀率极低，具备强执行可行性。"
 
     return f"""
     <div class="section-card">
         <div class="section-header">
-            <span class="section-icon">🛡</span>
-            <span>引擎 QA 审计</span>
-            <span class="section-sub">Engine Core QA</span>
+            <span class="section-icon">🏥</span>
+            <span>策略可执行性体检 (Capacity Health)</span>
+            <span class="section-sub">Capital / Capacity / Execution</span>
         </div>
-        <table class="base-table qa-table">
-            <thead><tr><th>检查项</th><th>结果</th><th>标准</th></tr></thead>
-            <tbody>{rows_html}</tbody>
+        <table class="base-table">
+            <thead><tr><th>检查维度</th><th>体检结果</th><th>诊断说明</th></tr></thead>
+            <tbody>
+                <tr><td>Capital 资金健康</td><td>{cap_badge}</td><td>{cap_desc}</td></tr>
+                <tr><td>Capacity 规模限制</td><td>{cap_badge_2}</td><td>{cap_desc_2}</td></tr>
+                <tr><td>Execution 滑点侵蚀率</td><td>{exe_badge}</td><td>{exe_desc}</td></tr>
+            </tbody>
         </table>
     </div>"""
 
@@ -275,33 +423,24 @@ def _build_kpi_strip(stats: dict) -> str:
     </div>"""
 
 
-def _build_stats_panel(stats: dict) -> str:
-    """右侧绩效详情面板，分组展示。"""
+def _build_stats_panel(stats: dict, metrics: dict) -> str:
     GROUPS = [
         ("盈亏表现", [
-            ("总收益率", "total_return"),
-            ("年化收益率", "annual_return"),
             ("总净盈亏", "total_net_pnl"),
-            ("日均盈亏", "daily_net_pnl"),
-            ("期末资金", "end_balance"),
+            ("理论无摩擦盈亏", "_gross_pnl"),
+            ("年化收益率", "annual_return"),
         ]),
         ("风险指标", [
             ("最大回撤", "max_drawdown"),
-            ("回撤百分比", "max_ddpercent"),
-            ("最大回撤期(交易日)", "max_drawdown_duration"),
+            ("最大回撤期(日)", "max_drawdown_duration"),
             ("夏普比率", "sharpe_ratio"),
-            ("EWM Sharpe", "ewm_sharpe"),
             ("收益回撤比", "return_drawdown_ratio"),
             ("RGR Ratio", "rgr_ratio"),
         ]),
         ("成本摩擦 All-in", [
             ("策略成交笔数", "total_trade_count"),
             ("换月次数", "rollover_count"),
-            ("策略手续费", "total_commission"),
-            ("换月手续费", "total_rollover_commission"),
             ("综合手续费", "all_in_commission"),
-            ("策略滑点", "total_slippage"),
-            ("换月滑点", "total_rollover_slippage"),
             ("综合滑点", "all_in_slippage"),
         ]),
         ("统计周期", [
@@ -314,18 +453,37 @@ def _build_stats_panel(stats: dict) -> str:
 
     HIGHLIGHT = {"all_in_commission", "all_in_slippage", "rollover_count"}
 
+    stats_copy = stats.copy()
+    if metrics and "execution" in metrics:
+        stats_copy["_gross_pnl"] = metrics["execution"]["gross_pnl"]
+
     parts = []
     for group_name, keys in GROUPS:
         parts.append(f"<div class='stat-group-label'>{group_name}</div>")
         for label, k in keys:
-            if k not in stats:
-                continue
-            val = _fmt_stat(k, stats[k])
+            if k not in stats_copy: continue
+
+            # 使用 Flex column 拆解排版
+            if k == "all_in_commission":
+                val_main = _fmt_stat(k, stats_copy[k])
+                val_s = _fmt_stat('total_commission', stats_copy.get('total_commission', 0))
+                val_r = _fmt_stat('total_rollover_commission', stats_copy.get('total_rollover_commission', 0))
+                val = f"<div class='stat-val-container'><div>{val_main}</div><div class='stat-breakdown'><span>策:{val_s}</span><span style='margin-left:8px'>换:{val_r}</span></div></div>"
+            elif k == "all_in_slippage":
+                val_main = _fmt_stat(k, stats_copy[k])
+                val_s = _fmt_stat('total_slippage', stats_copy.get('total_slippage', 0))
+                val_r = _fmt_stat('total_rollover_slippage', stats_copy.get('total_rollover_slippage', 0))
+                val = f"<div class='stat-val-container'><div>{val_main}</div><div class='stat-breakdown'><span>策:{val_s}</span><span style='margin-left:8px'>换:{val_r}</span></div></div>"
+            else:
+                val = f"<div class='stat-val-container'><div>{_fmt_stat(k, stats_copy[k])}</div></div>"
+
             hl = " stat-highlight" if k in HIGHLIGHT else ""
+
+            # 🟢 修复：将 span 升级为 div 容器，避免非法的 HTML 嵌套错位
             parts.append(f"""
             <div class="stat-row{hl}">
-                <span class="stat-key">{label}</span>
-                <span class="stat-val">{val}</span>
+                <div class="stat-key">{label}</div>
+                <div class="stat-val">{val}</div>
             </div>""")
 
     return "\n".join(parts)
@@ -344,13 +502,11 @@ def _build_chart(engine, df) -> str:
     plot_df["net_value"] = plot_df["balance"] / capital
     plot_df["highlevel"] = plot_df["balance"].cummax()
     plot_df["ddpercent"] = (plot_df["balance"] - plot_df["highlevel"]) / plot_df["highlevel"] * 100
-    plot_df["cum_pnl"] = plot_df["net_pnl"].cumsum()
 
     x = [str(i) for i in plot_df.index]
     net_value = plot_df["net_value"].astype(float).tolist()
     ddpercent = plot_df["ddpercent"].astype(float).tolist()
     net_pnl = plot_df["net_pnl"].astype(float).tolist()
-    cum_pnl = plot_df["cum_pnl"].astype(float).tolist()
 
     step = max(1, len(x) // 10)
     sparse_x = x[::step]
@@ -390,39 +546,22 @@ def _build_chart(engine, df) -> str:
     fig3 = go.Figure(go.Bar(x=x, y=net_pnl, name="日盈亏", marker_color=bar_colors))
     fig3.update_layout(**_base_layout())
 
-    fig4 = go.Figure(
-        go.Scatter(x=x,
-                   y=cum_pnl,
-                   fill="tozeroy",
-                   name="累计盈亏",
-                   line=dict(color="#22d3ee", width=1.5),
-                   fillcolor="rgba(34,211,238,0.08)"))
-    fig4.update_layout(**_base_layout())
-
     j1 = pio.to_json(fig1, engine="json")
     j2 = pio.to_json(fig2, engine="json")
     j3 = pio.to_json(fig3, engine="json")
-    j4 = pio.to_json(fig4, engine="json")
 
     return f"""
     <div class="chart-tabs">
         <button class="chart-tab-btn active" data-tab="c_netval">📈 单位净值</button>
         <button class="chart-tab-btn" data-tab="c_dd">📉 回撤 %</button>
         <button class="chart-tab-btn" data-tab="c_daily">📊 每日盈亏</button>
-        <button class="chart-tab-btn" data-tab="c_cum">💰 累计盈亏</button>
     </div>
     <div id="c_netval" class="chart-tab-pane active"><div id="chart_netval" style="width:100%;height:320px;"></div></div>
     <div id="c_dd"     class="chart-tab-pane"><div id="chart_dd" style="width:100%;height:320px;"></div></div>
     <div id="c_daily"  class="chart-tab-pane"><div id="chart_daily" style="width:100%;height:320px;"></div></div>
-    <div id="c_cum"    class="chart-tab-pane"><div id="chart_cum" style="width:100%;height:320px;"></div></div>
     <script>
     (function(){{
-        var charts = {{
-            chart_netval: {j1},
-            chart_dd:     {j2},
-            chart_daily:  {j3},
-            chart_cum:    {j4}
-        }};
+        var charts = {{ chart_netval: {j1}, chart_dd: {j2}, chart_daily: {j3} }};
         Plotly.newPlot('chart_netval', charts.chart_netval.data, charts.chart_netval.layout, {{responsive:true, displayModeBar:false}});
         var rendered = {{chart_netval: true}};
         document.querySelectorAll('.chart-tab-btn').forEach(function(btn) {{
@@ -590,35 +729,65 @@ def _build_mapping_table(engine) -> str:
 
 
 def _build_rollover_audit(engine) -> str:
-    rollover_logs = engine.get_rollover_logs()
-    if not rollover_logs:
-        return "<div class='empty-state'>本次回测未检测到换月摩擦。</div>"
+    get_logs_func = getattr(engine, "get_rollover_logs", None)
+    rollover_logs = get_logs_func() if callable(get_logs_func) else getattr(engine, "rollover_logs", [])
+
+    # 计算静默预警指标
+    mismatch_count = len(getattr(engine, "warmup_interval_mismatch_logs", []))
+    missing_dts = []
+
+    raw_rollover_dts = [log.get("datetime") for log in rollover_logs if log.get("status") not in ("FAILED", )]
+    clean_rollover_dts = {_norm_dt(d) for d in raw_rollover_dts if d is not None}
+
+    if clean_rollover_dts and hasattr(engine, "history_data"):
+        dt_to_index = {
+            _norm_dt(b.datetime): i
+            for i, b in enumerate(getattr(engine, "history_data", [])) if hasattr(b, "datetime")
+        }
+        for rdt in clean_rollover_dts:
+            if dt_to_index.get(rdt) is None:
+                missing_dts.append(rdt)
+
+    warnings = []
+    if mismatch_count > 0: warnings.append(f"监测到 {mismatch_count} 次换月前后周期映射错配")
+    if missing_dts: warnings.append(f"监测到 {len(missing_dts)} 处换月动作对应的物理 K 线缺失")
+
+    warning_html = ""
+    if warnings:
+        warning_html = f"<div class='hint-line' style='color:#f59e0b; padding:8px; background:rgba(245,158,11,0.1); border-radius:4px; margin-bottom:8px;'>⚠️ 诊断发现: {' | '.join(warnings)}。</div>"
+
+    valid_logs = [log for log in rollover_logs if log.get("status") != "FAILED"]
+    if not valid_logs:
+        return f"{warning_html}<div class='empty-state'>本次回测未检测到换月摩擦。</div>"
 
     rows = []
-    for log in rollover_logs:
-        if log.get("status") == "FAILED":
-            continue
-        dt_str = log["datetime"].strftime("%Y-%m-%d")
+    for log in valid_logs:
+        dt_raw = log.get("datetime")
+        dt_str = dt_raw.strftime("%Y-%m-%d") if dt_raw else "N/A"
+
         rows.append(f"""<tr>
             <td class='mono'>{dt_str}</td>
-            <td class='mono sym-old'>{log['old_symbol']}</td>
-            <td class='mono sym-new'>{log['new_symbol']}</td>
-            <td>{log['direction']}</td>
-            <td class='mono'>{log['volume']}</td>
-            <td class='mono'>{log['ref_price']:.2f}</td>
-            <td class='mono'>{log['commission']:.2f}</td>
-            <td class='mono'>{log['slippage']:.2f}</td>
-            <td class='mono pnl-neg'>{log['rollover_pnl']:.2f}</td>
+            <td class='mono sym-old'>{log.get('old_symbol', 'N/A')}</td>
+            <td class='mono sym-new'>{log.get('new_symbol', 'N/A')}</td>
+            <td>{log.get('direction', 'N/A')}</td>
+            <td class='mono'>{log.get('volume', 0)}</td>
+            <td class='mono'>{log.get('ref_price', 0.0):.2f}</td>
+            <td class='mono'>{log.get('commission', 0.0):.2f}</td>
+            <td class='mono'>{log.get('slippage', 0.0):.2f}</td>
+            <td class='mono pnl-neg'>{log.get('rollover_pnl', 0.0):.2f}</td>
         </tr>""")
 
     return f"""
-    <table class="base-table">
-        <thead><tr>
-            <th>日期</th><th>旧合约</th><th>新合约</th><th>方向</th>
-            <th>手数</th><th>基准价</th><th>手续费</th><th>滑点</th><th>摩擦损耗</th>
-        </tr></thead>
-        <tbody>{"".join(rows)}</tbody>
-    </table>"""
+    {warning_html}
+    <div class="scroll-box" style="max-height: 400px;">
+        <table class="base-table">
+            <thead><tr>
+                <th>日期</th><th>旧合约</th><th>新合约</th><th>方向</th>
+                <th>手数</th><th>基准价</th><th>手续费</th><th>滑点</th><th>摩擦损耗</th>
+            </tr></thead>
+            <tbody>{"".join(rows)}</tbody>
+        </table>
+    </div>"""
 
 
 def _build_orders_table(engine) -> str:
@@ -799,24 +968,25 @@ def _build_daily_results_table(df) -> str:
 
 
 def generate_web_report(engine, df, stats, result_dir):
-    # 构建各个 HTML 碎片
+    v15_metrics = _aggregate_v15_metrics(engine, stats)
+
     kpi_html = _build_kpi_strip(stats)
+    config_html = _build_config_strip(engine)
+    health_html = _build_health_panel(v15_metrics)
     qa_html = _build_qa_summary(engine)
     mapping_html = _build_mapping_table(engine)
     chart_html = _build_chart(engine, df)
     daily_html = _build_daily_results_table(df)
-    stats_html = _build_stats_panel(stats)
+    stats_html = _build_stats_panel(stats, v15_metrics)
     orders_html = _build_orders_table(engine)
     trades_html = _build_trades_table(engine)
     rollover_html = _build_rollover_audit(engine)
     intent_audit_html = _build_intent_audit_table(engine)
     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # 获取当前目录下的 templates 路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
     tpl_dir = os.path.join(current_dir, "templates")
 
-    # 读取前端资产文件
     with open(os.path.join(tpl_dir, "style.css"), "r", encoding="utf-8") as f:
         style_content = f.read()
     with open(os.path.join(tpl_dir, "script.js"), "r", encoding="utf-8") as f:
@@ -824,11 +994,12 @@ def generate_web_report(engine, df, stats, result_dir):
     with open(os.path.join(tpl_dir, "report_template.html"), "r", encoding="utf-8") as f:
         html_template = f.read()
 
-    # 安全地进行占位符替换 (不使用 f-string 或 format 以防花括号冲突)
     html_output = html_template.replace("{{ STYLE_CONTENT }}", style_content) \
                                .replace("{{ SCRIPT_CONTENT }}", script_content) \
                                .replace("{{ TIMESTAMP }}", ts_str) \
                                .replace("{{ KPI_STRIP }}", kpi_html) \
+                               .replace("{{ CONFIG_STRIP }}", config_html) \
+                               .replace("{{ HEALTH_PANEL_HTML }}", health_html) \
                                .replace("{{ QA_HTML }}", qa_html) \
                                .replace("{{ MAPPING_HTML }}", mapping_html) \
                                .replace("{{ CHART_HTML }}", chart_html) \
@@ -839,7 +1010,6 @@ def generate_web_report(engine, df, stats, result_dir):
                                .replace("{{ STATS_HTML }}", stats_html)\
                                .replace("{{ INTENT_AUDIT_HTML }}", intent_audit_html)
 
-    # 写入最终结果
     report_file = os.path.join(result_dir, f"report_{datetime.now().strftime('%H%M%S')}.html")
     with open(report_file, "w", encoding="utf-8") as f:
         f.write(html_output)

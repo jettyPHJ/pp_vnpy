@@ -16,8 +16,7 @@ from vnpy.trader.object import HistoryRequest
 from vnpy.trader.datafeed import get_datafeed
 from vnpy.trader.database import get_database
 from vnpy.trader.constant import Exchange
-from system_validator import (validate_v1_3_dod, validate_v1_4_directional_constraint, validate_v1_4_double_deduction,
-                              validate_v1_4_behavior_precision, validate_v1_4_accounting_price)
+from system_validator import run_all_system_validations
 from vnpy_ctastrategy.strategies.v13_mock_strategy import V13MockStrategy
 
 
@@ -112,15 +111,7 @@ def run_main() -> None:
     stats = engine.calculate_statistics()
 
     print("\n" + "=" * 50)
-    print("⏳ 开始执行 V1.3 架构防爆与对账验证...")
-    validate_v1_3_dod(engine)
-    print("=" * 50 + "\n")
-
-    print("\n⏳ 开始执行 V1.4 执行摩擦模块化验证...")
-    validate_v1_4_directional_constraint(engine)
-    validate_v1_4_double_deduction(engine)
-    validate_v1_4_behavior_precision(engine)
-    validate_v1_4_accounting_price(engine)
+    run_all_system_validations(engine)
     print("=" * 50 + "\n")
 
     # 报告输出目录：相对于本脚本所在的 test/ 文件夹
