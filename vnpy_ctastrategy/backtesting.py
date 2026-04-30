@@ -24,14 +24,17 @@ from .order_flow.pipeline import OrderPipeline
 from .order_flow.models import RiskDecision
 from vnpy.trader.optimize import (OptimizationSetting, check_optimization_setting, run_bf_optimization, run_ga_optimization)
 
-from .base import (BacktestingMode, EngineType, STOPORDER_PREFIX, StopOrder, StopOrderStatus, INTERVAL_DELTA_MAP)
+from .base import (BacktestingMode, EngineType, STOPORDER_PREFIX, StopOrder, StopOrderStatus, INTERVAL_DELTA_MAP, FrictionMode)
 from .template import CtaTemplate
 from .locale import _
 from .continuous_builder import ContinuousBuilder
 
 # 导入可热插拔的模块接口与 V1 默认实现
 from .back_modules import (BaseMarginModel, BaseSlippageModel, BaseExecutionModel, BaseCommissionModel, V1DefaultMarginModel,
-                           V1DefaultSlippageModel, V1DefaultExecutionModel, V1DefaultCommissionModel)
+                           V1DefaultSlippageModel, V1DefaultExecutionModel, V1DefaultCommissionModel, TickExecutionModel)
+from .order_flow.tick_replay_store import TickReplayStore, TickExecutionContext
+from .order_flow.friction import FillMode, TickExecutionResult
+from .base import TIF
 
 from vnpy_ctastrategy.base import ExecutionProfile
 from vnpy_ctastrategy.back_modules import VolumeImpactSlippageModel
@@ -60,8 +63,8 @@ class BacktestingEngine:
         self.annual_days: int = 240
         self.half_life: int = 120
         self.mode: BacktestingMode = BacktestingMode.BAR
-        self.by_volume: bool = False  # 🟢 暴露按手收费参数
-        self.friction_mode: str = "legacy"
+        self.by_volume: bool = False
+        self.friction_mode: FrictionMode = FrictionMode.LEGACY
         self.trade_friction_map: dict[str, dict] = {}
 
         self.strategy_class: type[CtaTemplate]
@@ -134,6 +137,21 @@ class BacktestingEngine:
         self.tr_windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=14))
         self.last_closes: dict[str, float] = {}
 
+        # V1.6 Tick Replay 新增字段
+        self.last_bar_decision_dt: datetime | None = None
+        self.tick_replay_store: TickReplayStore = TickReplayStore()
+        self.tick_execution_model: TickExecutionModel = TickExecutionModel()
+        self.tick_fill_mode: FillMode = FillMode.TOP_OF_BOOK_CAPPED
+        self.tick_participation_rate: float = 0.3
+        self.order_tif_map: dict[str, TIF] = {}
+        self.order_signal_bar_dt: dict[str, datetime] = {}
+        self.tick_replay_stats: dict[str, int] = {
+            "ticks_loaded": 0,
+            "ticks_replayed": 0,
+            "orders_seen": 0,
+            "fills": 0,
+        }
+
     def clear_data(self) -> None:
         """Clear all data of last backtesting."""
         self.stop_order_count = 0
@@ -183,6 +201,19 @@ class BacktestingEngine:
         self.vol_windows = defaultdict(lambda: deque(maxlen=20))
         self.tr_windows = defaultdict(lambda: deque(maxlen=14))
         self.last_closes = {}
+
+        # V1.6 重置 Tick Replay 状态
+        self.last_bar_decision_dt = None
+        self.tick_replay_store = TickReplayStore()
+        self.tick_execution_model = TickExecutionModel()
+        self.order_tif_map = {}
+        self.order_signal_bar_dt = {}
+        self.tick_replay_stats = {
+            "ticks_loaded": 0,
+            "ticks_replayed": 0,
+            "orders_seen": 0,
+            "fills": 0,
+        }
 
     def _normalize_datetime(self, dt) -> datetime:
         """
@@ -292,7 +323,7 @@ class BacktestingEngine:
         total_slippage = sum([result.slippage for result in self.daily_results.values()])
         rollover_from_logs = sum([log.get("rollover_pnl", 0) for log in self.rollover_logs])
 
-        if getattr(self, "friction_mode", "legacy") == "legacy":
+        if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.LEGACY:
             expected_net_pnl = theoretical_pnl - total_commission - total_slippage + rollover_from_logs
         else:
             expected_net_pnl = theoretical_pnl - total_commission + rollover_from_logs
@@ -335,7 +366,7 @@ class BacktestingEngine:
                        physical_symbols: list = None,
                        by_volume: bool = False,
                        warmup_days: int = 120,
-                       friction_mode: str = "legacy") -> None:
+                       friction_mode: FrictionMode = FrictionMode.LEGACY) -> None:
         """"""
         self.mode = mode
         self.vt_symbol = vt_symbol
@@ -365,7 +396,7 @@ class BacktestingEngine:
         self.physical_symbols = [self._normalize_vt_symbol(s) for s in physical_symbols] if physical_symbols else []
         self.warmup_days = warmup_days
 
-        # 🟢 初始化加载 V1 默认执行模型，传入按手配置
+        # 初始化加载 V1 默认执行模型，传入按手配置
         self.margin_model = V1DefaultMarginModel()
         self.slippage_model = V1DefaultSlippageModel(self.slippage)
         self.execution_model = V1DefaultExecutionModel()
@@ -430,6 +461,18 @@ class BacktestingEngine:
             self.history_data.clear()
             self.warmup_data.clear()
             return
+
+        if self.friction_mode == FrictionMode.TICK_REPLAY:
+            total_ticks = 0
+            for vt_sym in self.physical_symbols:
+                symbol, exchange = extract_vt_symbol(vt_sym)
+                ticks = load_tick_data(symbol, exchange, warmup_start, self.end)
+                for tick in ticks:
+                    tick.datetime = self._normalize_datetime(tick.datetime)
+                self.tick_replay_store.load(vt_sym, ticks)
+                total_ticks += len(ticks)
+            self.tick_replay_stats["ticks_loaded"] = total_ticks
+            self.output(f"✅ TickReplayStore 加载完成：{len(self.physical_symbols)} 个合约，共 {total_ticks} 笔 Tick")
 
         self.output(_("历史数据构建完毕，回测段：{}根，暖机段：{}根").format(len(self.history_data), len(self.warmup_data)))
 
@@ -684,7 +727,7 @@ class BacktestingEngine:
             self.output(_("最大回撤天数: \t{}").format(max_drawdown_duration))
             self.output(_("总盈亏：\t{:,.2f}").format(total_net_pnl))
             self.output(_("总手续费：\t{:,.2f}").format(total_commission))
-            if getattr(self, "friction_mode", "legacy") == "legacy":
+            if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.LEGACY:
                 self.output(_("总滑点（独立扣减项）：\t{:,.2f}").format(total_slippage))
             else:
                 self.output(_("总滑点（已内嵌至成交价）：\t{:,.2f}").format(total_slippage))
@@ -705,8 +748,10 @@ class BacktestingEngine:
         # 统计完成后，自动执行底层的强制对账
         self._audit_financial_consistency()
 
-        embedded_slippage_cost = total_slippage if getattr(self, "friction_mode", "legacy") == "v1.4" else 0.0
-        deducted_slippage_cost = total_slippage if getattr(self, "friction_mode", "legacy") == "legacy" else 0.0
+        embedded_slippage_cost = total_slippage if getattr(self, "friction_mode",
+                                                           FrictionMode.LEGACY) == FrictionMode.BAR_ENHANCED else 0.0
+        deducted_slippage_cost = total_slippage if getattr(self, "friction_mode",
+                                                           FrictionMode.LEGACY) == FrictionMode.LEGACY else 0.0
 
         statistics: dict = {
             "start_date": start_date,
@@ -984,6 +1029,10 @@ class BacktestingEngine:
                         self.output(_("[{}] 💰 执行换月仓位平移，产生纯摩擦损耗(滑点+手续费): {:.2f}").format(self.datetime, rollover_pnl))
 
                 self.current_physical_symbol = best_symbol
+
+                # V1.6：换月后定位新合约的 Tick 游标
+                if self.friction_mode == FrictionMode.TICK_REPLAY:
+                    self.tick_replay_store.seek_to(best_symbol, self.datetime)
         except Exception as e:
             self.rollover_logs.append({
                 "datetime": self.datetime,
@@ -1001,6 +1050,7 @@ class BacktestingEngine:
         max_order_size: float = 50.0,
         max_participation_rate: float = 0.15,
         impact_factor: float = 1.5,
+        use_tick_replay: bool = False,
     ):
         """配置业务级执行环境"""
         if not getattr(self, "vt_symbol", ""):
@@ -1009,12 +1059,13 @@ class BacktestingEngine:
             raise RuntimeError("⚠️ 审计管道未就绪，请检查 BacktestingEngine.__init__ 是否正确执行。")
 
         self.execution_profile = profile
+        self.margin_rate = margin_rate  # [V1.6 升级] 显式解耦保存
 
         self.output("-" * 50)
         self.output(f"⚙️ Execution Profile: {profile.name}")
 
         if profile == ExecutionProfile.REALISTIC:
-            self.friction_mode = "v1.4"
+            self.friction_mode = FrictionMode.TICK_REPLAY if use_tick_replay else FrictionMode.BAR_ENHANCED
             self.slippage_model = VolumeImpactSlippageModel(impact_factor=impact_factor)
             self.order_pipeline.risk_manager = CapitalAndSizeRiskManager(margin_rate=margin_rate,
                                                                          max_order_size=max_order_size,
@@ -1023,34 +1074,48 @@ class BacktestingEngine:
             self.output(f"   - Participation Limit: Enabled ({max_participation_rate * 100}%)")
             self.output(f"   - Dynamic Slippage: Enabled (Impact {impact_factor})")
             self.output(f"   - Stop Order Pipeline: Enabled (Strict Auditing)")
+            if use_tick_replay:
+                self.output(f"   - Tick Replay: Enabled (physical Tick execution)")
 
         elif profile == ExecutionProfile.STANDARD:
-            self.friction_mode = "v1.4"
+            self.friction_mode = FrictionMode.TICK_REPLAY if use_tick_replay else FrictionMode.BAR_ENHANCED
             self.order_pipeline.risk_manager = DummyRiskManager()
             self.output(f"   - Base Pipeline: Enabled (V1.4 Routing)")
             self.output(f"   - Risk/Capacity Constraints: Disabled")
+            if use_tick_replay:
+                self.output(f"   - Tick Replay: Enabled (physical Tick execution)")
 
         else:
-            self.friction_mode = "legacy"
+            self.friction_mode = FrictionMode.LEGACY
             self.order_pipeline.risk_manager = DummyRiskManager()
             self.output(f"   - Mode: Native unconstrained simulation")
 
         self.output("-" * 50)
 
     def new_bar(self, bar: BarData) -> None:
-        self.bar = bar
-        self.datetime = bar.datetime
+        if self.friction_mode == FrictionMode.TICK_REPLAY:
+            # V1.6 双时间线：先用上一根 Bar 期间的 Tick 执行旧订单，再换月并让策略读取当前 Bar。
+            if self.last_bar_decision_dt is not None:
+                self._replay_ticks_until(self.last_bar_decision_dt, bar.datetime)
+                self._expire_bar_end_orders(bar.datetime)
 
-        self._do_rollover()
-        self.cross_limit_order()
-        self.cross_stop_order()
-        self.strategy.on_bar(bar)
+            self.bar = bar
+            self.datetime = bar.datetime
+            self._do_rollover()
+            self.last_bar_decision_dt = bar.datetime
+            self.strategy.on_bar(bar)
+        else:
+            self.bar = bar
+            self.datetime = bar.datetime
+            self._do_rollover()
+            self.cross_limit_order()
+            self.cross_stop_order()
+            self.strategy.on_bar(bar)
+
         self.update_daily_close(bar.close_price)
 
-        # ==============================================================
-        # V1.5 修复：同时维护“连续合约”和“物理合约”的双轨容量观察窗口
-        # ==============================================================
-        vt = bar.vt_symbol
+        # 连续合约的窗口维护
+        vt = self.vt_symbol
         self.vol_windows[vt].append(bar.volume)
         last_c = self.last_closes.get(vt)
         if last_c is not None:
@@ -1078,6 +1143,276 @@ class BacktestingEngine:
                     )
                     self.tr_windows[phys_vt].append(tr_phys)
                 self.last_closes[phys_vt] = phys_bar.close_price
+
+    # ==============================================================
+    # V1.6 Tick Replay 撮合方法组
+    # ==============================================================
+
+    def _replay_ticks_until(self, after_dt: datetime, until_dt: datetime) -> None:
+        """
+        消费 (after_dt, until_dt] 窗口内的所有 Tick，逐笔撮合活跃订单。
+        物理合约和连续合约都使用同一个 TickReplayStore，按 current_physical_symbol 路由。
+        """
+        symbol = self.current_physical_symbol or self.vt_symbol
+        for ctx in self.tick_replay_store.replay_window(symbol, after_dt, until_dt):
+            self.tick_replay_stats["ticks_replayed"] += 1
+            self.tick_replay_stats["orders_seen"] += len(self.active_limit_orders) + len(self.active_stop_orders)
+            self._cross_limit_order_by_tick(ctx)
+            self._cross_stop_order_by_tick(ctx)
+
+    def _cross_limit_order_by_tick(self, ctx: TickExecutionContext) -> None:
+        """逐笔撮合活跃限价单。"""
+        for order in list(self.active_limit_orders.values()):
+            result = self.tick_execution_model.match(order, ctx, self.tick_fill_mode, self.tick_participation_rate)
+            if result.matched and result.fill_volume > 0:
+                self._apply_tick_fill(order, result, ctx)
+
+    def _cross_stop_order_by_tick(self, ctx: TickExecutionContext) -> None:
+        """逐笔撮合活跃止损单。"""
+        for stop_order in list(self.active_stop_orders.values()):
+            result = self.tick_execution_model.match_stop(stop_order, ctx, self.tick_fill_mode, self.tick_participation_rate)
+            if not result.matched:
+                continue
+
+            # 止损单已触发，从 stop 池移除
+            stop_order.status = StopOrderStatus.TRIGGERED
+            self.active_stop_orders.pop(stop_order.stop_orderid, None)
+            self._record_stop_order_history(stop_order)
+            self._call_strategy_on_stop_order(stop_order)
+
+            # 本 Tick 成交部分
+            if result.fill_volume > 0:
+                self._create_stop_trade(stop_order, result, ctx)
+
+            # 若有剩余量：转为 synthetic aggressive limit order
+            if result.remaining_volume > 0:
+                self._inject_synthetic_aggressive_order(stop_order, result.remaining_volume, ctx)
+
+    def _create_stop_trade(self, stop_order, result: 'TickExecutionResult', ctx: TickExecutionContext) -> None:
+        """止损单触发后为本 Tick 成交量构造 TradeData。"""
+        import math as _math
+        self.trade_count += 1
+        execution_price = result.match_price
+
+        trade = TradeData(
+            symbol=stop_order.vt_symbol.split(".")[0],
+            exchange=self.exchange,
+            orderid=stop_order.stop_orderid,
+            tradeid=str(self.trade_count),
+            direction=stop_order.direction,
+            offset=stop_order.offset,
+            price=execution_price,
+            volume=result.fill_volume,
+            datetime=ctx.dt,
+            gateway_name=self.gateway_name,
+        )
+        trade.physical_price = execution_price
+        trade.accounting_price = execution_price
+        trade.price_offset = 0.0
+
+        comm_res = self.commission_model.calculate_v14(trade, self.size)
+
+        from .order_flow.friction import SlippageResult
+        audit_slip = SlippageResult(
+            execution_price=execution_price,
+            price_diff=execution_price - stop_order.price,
+            model_name="TickReplay_StopTrigger",
+        )
+
+        self.strategy.pos = self.position_ledger.apply_trade(trade)
+        self._call_strategy_on_trade(trade)
+        self.trades[trade.vt_tradeid] = trade
+
+        vt_sym = self._normalize_vt_symbol(f"{trade.symbol}.{trade.exchange.value}")
+        pos_change = result.fill_volume if trade.direction == Direction.LONG else -result.fill_volume
+        self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
+        self.tick_replay_stats["fills"] += 1
+
+        # StopOrder 默认不经过 V1.5 pipeline。若外部后续补了 stop-chain，则优先纳入链路；否则保留 standalone 审计。
+        source_chain_id = getattr(stop_order, "chain_id", None)
+        if source_chain_id and source_chain_id in self.intent_tracker.chain_audit_map:
+            self.intent_tracker.bind_order(
+                stop_order.stop_orderid,
+                source_chain_id,
+                exec_id=f"STOP_{stop_order.stop_orderid}",
+                volume=stop_order.volume,
+            )
+            self.intent_tracker.record_trade(
+                trade,
+                match_result=result,
+                slippage_result=audit_slip,
+                commission_result=comm_res,
+                contract_multiplier=self.size,
+                tick_fill_mode=self.tick_fill_mode,
+                tick_fill_volume=result.fill_volume,
+                tick_remaining=result.remaining_volume,
+                tick_mid_price=result.mid_price,
+                tick_mid_offset=execution_price - result.mid_price if result.mid_price else 0.0,
+            )
+        else:
+            self.intent_tracker.record_standalone_trade(
+                trade,
+                reason="STOP_ORDER_TICK",
+                slippage_result=audit_slip,
+                commission_result=comm_res,
+                contract_multiplier=self.size,
+            )
+
+    def _apply_tick_fill(self, order, result: 'TickExecutionResult', ctx: TickExecutionContext) -> None:
+        """
+        处理限价单的 Tick 成交：更新订单状态，构造 TradeData，记录审计。
+        V1.6：执行价直接取盘口价，不二次叠加 Bar slippage model。
+        """
+        import math as _math
+        fill_vol = result.fill_volume
+        order.traded += fill_vol
+
+        if _math.isclose(order.traded, order.volume, abs_tol=1e-8):
+            order.status = Status.ALLTRADED
+            self.active_limit_orders.pop(order.vt_orderid, None)
+            self.order_tif_map.pop(order.vt_orderid, None)
+            self.order_signal_bar_dt.pop(order.vt_orderid, None)
+        else:
+            order.status = Status.PARTTRADED
+
+        self.intent_tracker.update_order(order)
+        self._record_limit_order_history(order)
+        self._call_strategy_on_order(order)
+        self.trade_count += 1
+
+        execution_price = result.match_price
+
+        trade = TradeData(
+            symbol=order.symbol,
+            exchange=order.exchange,
+            orderid=order.orderid,
+            tradeid=str(self.trade_count),
+            direction=order.direction,
+            offset=order.offset,
+            price=execution_price,
+            volume=fill_vol,
+            datetime=ctx.dt,
+            gateway_name=self.gateway_name,
+        )
+        trade.physical_price = execution_price
+        trade.accounting_price = execution_price + getattr(order, "price_offset", 0.0)
+        trade.price_offset = getattr(order, "price_offset", 0.0)
+
+        comm_res = self.commission_model.calculate_v14(trade, self.size)
+
+        from .order_flow.friction import SlippageResult
+        audit_slip = SlippageResult(
+            execution_price=execution_price,
+            price_diff=execution_price - order.price,
+            model_name="TickReplay_BidAsk",
+        )
+
+        self.strategy.pos = self.position_ledger.apply_trade(trade)
+        self._call_strategy_on_trade(trade)
+        self.trades[trade.vt_tradeid] = trade
+
+        vt_sym = self._normalize_vt_symbol(f"{trade.symbol}.{trade.exchange.value}")
+        pos_change = fill_vol if trade.direction == Direction.LONG else -fill_vol
+        self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
+        self.tick_replay_stats["fills"] += 1
+
+        mid_offset = execution_price - result.mid_price if result.mid_price else 0.0
+
+        self.intent_tracker.record_trade(
+            trade,
+            match_result=result,
+            slippage_result=audit_slip,
+            commission_result=comm_res,
+            contract_multiplier=self.size,
+            tick_fill_mode=self.tick_fill_mode,
+            tick_fill_volume=fill_vol,
+            tick_remaining=result.remaining_volume,
+            tick_mid_price=result.mid_price,
+            tick_mid_offset=mid_offset,
+        )
+
+    def _expire_bar_end_orders(self, current_bar_dt: datetime) -> None:
+        """
+        replay 完 (prev_bar_dt, current_bar_dt] 窗口后调用。
+        所有 signal_bar_dt < current_bar_dt 的 BAR_END 订单已超期，撤销。
+        GTC 订单不受影响。
+        """
+        to_cancel = [
+            vt_id for vt_id, sig_dt in self.order_signal_bar_dt.items()
+            if (self.order_tif_map.get(vt_id) == TIF.BAR_END and sig_dt < current_bar_dt and vt_id in self.active_limit_orders)
+        ]
+        for vt_id in to_cancel:
+            order = self.active_limit_orders.pop(vt_id, None)
+            if order:
+                remaining = order.volume - order.traded
+                order.status = Status.CANCELLED
+                self.intent_tracker.update_order(order)
+                self._record_limit_order_history(order)
+                self._call_strategy_on_order(order)
+                self.intent_tracker.record_cancellation(
+                    order,
+                    reason="TIF_BAR_END_EXPIRED",
+                    remaining_volume=remaining,
+                    cancelled_at=current_bar_dt,
+                )
+            self.order_tif_map.pop(vt_id, None)
+            self.order_signal_bar_dt.pop(vt_id, None)
+
+    def _inject_synthetic_aggressive_order(self, stop_order, remaining: float, ctx: TickExecutionContext) -> None:
+        """
+        止损触发后剩余量转为 aggressive limit order 进入 active_limit_orders。
+        价格设为当前 ask1/bid1（确保后续 Tick 仍触发主动成交条件）。
+        synthetic 订单默认 GTC（止损剩余量不应因 BAR_END 撤销）。
+        """
+        self.limit_order_count += 1
+        target_vt_symbol = self._normalize_vt_symbol(stop_order.vt_symbol)
+        target_symbol, target_exchange_str = target_vt_symbol.split(".")
+
+        is_long = stop_order.direction == Direction.LONG
+        aggressive_price = ctx.ask1 if is_long else ctx.bid1
+        if aggressive_price <= 0:
+            aggressive_price = ctx.last_price  # 盘口缺失时降级
+
+        order = OrderData(
+            symbol=target_symbol,
+            exchange=Exchange(target_exchange_str),
+            orderid=f"SYN_{self.limit_order_count}",
+            direction=stop_order.direction,
+            offset=stop_order.offset,
+            price=aggressive_price,
+            volume=remaining,
+            status=Status.NOTTRADED,
+            gateway_name=self.gateway_name,
+            datetime=ctx.dt,
+        )
+        order.physical_price = aggressive_price
+        order.accounting_price = aggressive_price
+        order.price_offset = 0.0
+        order.traded = 0.0
+
+        order.synthetic_aggressive = True
+        order.source_stop_orderid = stop_order.stop_orderid
+
+        self.active_limit_orders[order.vt_orderid] = order
+        self.limit_orders[order.vt_orderid] = order
+
+        # 尽量绑定回原 stop 所属 chain；当前 stop 默认 standalone，保留兜底不强行伪造链。
+        source_chain_id = (
+            getattr(stop_order, "chain_id", None)
+            or self.intent_tracker.orderid_chain_map.get(getattr(stop_order, "vt_orderid", ""))
+            or self.intent_tracker.orderid_chain_map.get(getattr(stop_order, "stop_orderid", ""))
+        )
+        if source_chain_id and source_chain_id in self.intent_tracker.chain_audit_map:
+            self.intent_tracker.bind_order(
+                order.vt_orderid,
+                source_chain_id,
+                exec_id=f"SYN_STOP_{stop_order.stop_orderid}",
+                volume=remaining,
+            )
+
+        # synthetic 订单 GTC，不受 BAR_END 撤销影响
+        self.order_tif_map[order.vt_orderid] = TIF.GTC
+        self.order_signal_bar_dt[order.vt_orderid] = ctx.dt
 
     def new_tick(self, tick: TickData) -> None:
         self.tick = tick
@@ -1111,7 +1446,7 @@ class BacktestingEngine:
                 self._record_limit_order_history(order)
                 self._call_strategy_on_order(order)
 
-            if getattr(self, "friction_mode", "legacy") == "v1.4":
+            if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.BAR_ENHANCED:
                 match_res = self.execution_model.match_limit_order_v14(order, current_data)
                 if not match_res.matched:
                     continue
@@ -1133,10 +1468,11 @@ class BacktestingEngine:
                 pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
                 self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
 
-                # V1.5：注入真实市场上下文，启用 calculate 统一接口
+                # [V1.6 升级] 注入真实市场上下文计算滑点
                 _vt_sym = self._normalize_vt_symbol(getattr(order, 'vt_symbol', f"{order.symbol}.{order.exchange.value}"))
                 _ctx = self.get_market_context(_vt_sym)
                 slip_res = self.slippage_model.calculate(order, match_res, self.size, _ctx)
+
                 trade: TradeData = TradeData(
                     symbol=order.symbol,
                     exchange=order.exchange,
@@ -1378,9 +1714,9 @@ class BacktestingEngine:
                 continue
 
             # =======================================================
-            # 🛡️ LEGACY / STANDARD 分支
+            # 🛡️ LEGACY / STANDARD 分支 (V1.6 升级：支持停止单 Context 注入)
             # =======================================================
-            if getattr(self, "friction_mode", "legacy") == "v1.4":
+            if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.BAR_ENHANCED:
                 match_res = self.execution_model.match_stop_order_v14(stop_order, current_data)
                 trade_price, trade_volume = match_res.match_price, match_res.volume
             else:
@@ -1431,8 +1767,10 @@ class BacktestingEngine:
             pos_change = trade_volume if order.direction == Direction.LONG else -trade_volume
             self.physical_positions[vt_sym] = self.physical_positions.get(vt_sym, 0) + pos_change
 
-            if getattr(self, "friction_mode", "legacy") == "v1.4":
-                slip_res = self.slippage_model.calculate_v14(order, match_res, self.size)
+            if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.BAR_ENHANCED:
+                # [V1.6 升级] 停止单同样透传 Context
+                _ctx = self.get_market_context(vt_sym)
+                slip_res = self.slippage_model.calculate(order, match_res, self.size, _ctx)
                 execution_price = slip_res.execution_price
             else:
                 slip_res = None
@@ -1453,7 +1791,7 @@ class BacktestingEngine:
             trade.physical_price = execution_price
             trade.price_offset = order_offset
 
-            if getattr(self, "friction_mode", "legacy") == "v1.4":
+            if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.BAR_ENHANCED:
                 comm_res = self.commission_model.calculate_v14(trade, self.size)
                 slippage_cost = abs(slip_res.price_diff) * trade_volume * self.size
                 self.trade_friction_map[trade.vt_tradeid] = {
@@ -1474,7 +1812,7 @@ class BacktestingEngine:
             self._call_strategy_on_stop_order(stop_order)
             self._call_strategy_on_order(order)
 
-            if getattr(self, "friction_mode", "legacy") == "v1.4":
+            if getattr(self, "friction_mode", FrictionMode.LEGACY) == FrictionMode.BAR_ENHANCED:
                 self.intent_tracker.record_standalone_trade(
                     trade,
                     reason="STOP_ORDER_TRIGGERED",
@@ -1700,6 +2038,12 @@ class BacktestingEngine:
 
         self.active_limit_orders[order.vt_orderid] = order
         self.limit_orders[order.vt_orderid] = order
+
+        # V1.6 Tick 模式：注入 TIF 和信号 Bar 时间（默认 BAR_END，策略可覆盖）
+        if self.friction_mode == FrictionMode.TICK_REPLAY:
+            self.order_tif_map[order.vt_orderid] = TIF.BAR_END
+            self.order_signal_bar_dt[order.vt_orderid] = self.datetime
+
         return order.vt_orderid
 
     def cancel_order(self, strategy: CtaTemplate, vt_orderid: str) -> None:
@@ -1759,8 +2103,27 @@ class BacktestingEngine:
     # ------------------------------------------------------------------
 
     def calculate_occupied_margin(self) -> float:
-        """V1.5 MVP：暂不实现复杂资金占用，返回 0 保证回测不中断。"""
-        return 0.0
+        """
+        [V1.6 MVP] 静态持仓保证金估算
+        注意：仅作为资金风控基础占用的 MVP 版本，未纳入浮动盈亏、挂单冻结。
+        """
+        total_margin = 0.0
+        margin_rate = getattr(self, "margin_rate", 0.10)
+
+        for vt_symbol, pos in self.physical_positions.items():
+            if pos == 0:
+                continue
+
+            last_price = self.last_closes.get(vt_symbol)
+            if last_price is None:
+                lookup_dt = self._normalize_lookup_dt(self.datetime)
+                phys_bar = self.physical_bars.get((vt_symbol, lookup_dt))
+                last_price = phys_bar.close_price if phys_bar else 0.0
+
+            if last_price > 0:
+                total_margin += abs(pos) * last_price * self.size * margin_rate
+
+        return total_margin
 
     def get_market_context(self, vt_symbol: str):
         """
@@ -1786,9 +2149,10 @@ class BacktestingEngine:
         )
 
     def get_account_snapshot(self):
-        """构造当前账户快照，以初始资金扣除已占用保证金作为可用资金。"""
+        """[V1.6] 构造账户快照，使风控模块的 REJECT 具有资金约束实质"""
         from .order_flow.models import AccountSnapshot
-        return AccountSnapshot(available_cash=self.capital - self.calculate_occupied_margin())
+        available = self.capital - self.calculate_occupied_margin()
+        return AccountSnapshot(available_cash=available)
 
 
 class DailyResult:

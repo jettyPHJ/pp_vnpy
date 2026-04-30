@@ -5,7 +5,8 @@ from vnpy.trader.object import OrderData, TradeData, BarData, TickData
 from vnpy.trader.constant import Direction
 
 from .base import StopOrder
-from .order_flow.friction import ExecutionMatchResult, MatchBehavior, SlippageResult, CommissionResult
+from .order_flow.friction import (ExecutionMatchResult, MatchBehavior, SlippageResult, CommissionResult, FillMode,
+                                  TickExecutionResult)
 
 
 class BaseMarginModel(ABC):
@@ -89,9 +90,7 @@ class V1DefaultSlippageModel(BaseSlippageModel):
         if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
             return SlippageResult(match_result.match_price, 0.0, "V1_Default_Slippage")
 
-        exec_price = match_result.match_price + (
-            self.slippage if order.direction == Direction.LONG else -self.slippage
-        )
+        exec_price = match_result.match_price + (self.slippage if order.direction == Direction.LONG else -self.slippage)
         return SlippageResult(exec_price, self.slippage, "V1_Default_Slippage")
 
     def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
@@ -102,9 +101,7 @@ class V1DefaultSlippageModel(BaseSlippageModel):
         if match_result.behavior == MatchBehavior.PASSIVE_LIMIT:
             return SlippageResult(match_result.match_price, 0.0, "V1_Default_Slippage")
 
-        execution_price = match_result.match_price + (
-            self.slippage if order.direction == Direction.LONG else -self.slippage
-        )
+        execution_price = match_result.match_price + (self.slippage if order.direction == Direction.LONG else -self.slippage)
         return SlippageResult(
             execution_price=execution_price,
             price_diff=execution_price - match_result.match_price,
@@ -133,9 +130,7 @@ class FixedTickSlippageModel(BaseSlippageModel):
         # 安全防线：order 若为原生 OrderData 无 pricetick 属性，则回退到 1.0
         pricetick = getattr(order, "pricetick", 1.0)
         price_diff = self.fixed_ticks * pricetick
-        exec_price = match_result.match_price + (
-            price_diff if order.direction == Direction.LONG else -price_diff
-        )
+        exec_price = match_result.match_price + (price_diff if order.direction == Direction.LONG else -price_diff)
         return SlippageResult(exec_price, price_diff, "FixedTick")
 
     def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
@@ -166,14 +161,12 @@ class VolumeImpactSlippageModel(BaseSlippageModel):
             return SlippageResult(match_result.match_price, 0.0, "VolumeImpact")
 
         # 从上下文提取参考均量，防零除；无上下文时退化为 1 手均量
-        ref_vol   = max(context.reference_volume, 1e-8) if context else 1.0
+        ref_vol = max(context.reference_volume, 1e-8) if context else 1.0
         # 从 order 提取 pricetick，兼容 ExecutionOrder 与原生 OrderData
         pricetick = getattr(order, "pricetick", 1.0)
 
         price_diff = self.impact_factor * self._sqrt(match_result.volume / ref_vol) * pricetick
-        exec_price = match_result.match_price + (
-            price_diff if order.direction == Direction.LONG else -price_diff
-        )
+        exec_price = match_result.match_price + (price_diff if order.direction == Direction.LONG else -price_diff)
         return SlippageResult(exec_price, price_diff, "VolumeImpact")
 
     def calculate_v14(self, order: OrderData, match_result: ExecutionMatchResult, contract_multiplier: float) -> SlippageResult:
@@ -276,3 +269,197 @@ class V1DefaultExecutionModel(BaseExecutionModel):
 
         trade_price = max(stop_order.price, long_best_price) if long_cross else min(stop_order.price, short_best_price)
         return trade_price, stop_order.volume
+
+
+# ==========================================
+# V1.6 Tick 撮合模型
+# ==========================================
+
+
+class TickExecutionModel:
+    """
+    V1.6 Tick 级撮合模型。
+    - match()      : 撮合限价单，返回 TickExecutionResult（不含 Bar slippage）
+    - match_stop() : 撮合止损单，返回 TickExecutionResult
+
+    执行价直接取盘口价，不二次叠加 Bar slippage model。
+    成本归因：execution_price - mid_price 记录在审计字段，而非额外滑点。
+    """
+
+    def match(
+        self,
+        order: OrderData,
+        ctx,  # TickExecutionContext
+        fill_mode: FillMode,
+        participation_rate: float = 0.3,
+    ) -> TickExecutionResult:
+        """
+        撮合限价单。
+        主动成交条件（AGGRESSIVE）：买单 price >= ask1；卖单 price <= bid1。
+        被动成交条件（PASSIVE）：买单 last_price <= order.price；卖单 last_price >= order.price。
+        """
+        remaining = order.volume - order.traded
+        no_fill = TickExecutionResult(
+            matched=False,
+            behavior=MatchBehavior.AGGRESSIVE_LIMIT,
+            match_price=0.0,
+            fill_volume=0.0,
+            remaining_volume=remaining,
+            mid_price=ctx.mid_price,
+            spread=ctx.spread,
+        )
+
+        if remaining <= 0:
+            return no_fill
+
+        is_long = order.direction == Direction.LONG
+
+        # synthetic aggressive 单：止损触发后的剩余量，始终按当前对手盘主动撮合，不再受原 order.price 限制。
+        if getattr(order, "synthetic_aggressive", False):
+            if is_long:
+                match_price = ctx.ask1 if ctx.ask1 > 0 else ctx.last_price
+                available_vol = ctx.ask_vol_1
+            else:
+                match_price = ctx.bid1 if ctx.bid1 > 0 else ctx.last_price
+                available_vol = ctx.bid_vol_1
+
+            if match_price <= 0 or available_vol <= 0:
+                return no_fill
+
+            fill_vol = remaining if fill_mode == FillMode.FULL_VOLUME else min(remaining, max(available_vol, 0.0))
+            if fill_vol <= 0:
+                return no_fill
+
+            return TickExecutionResult(
+                matched=True,
+                behavior=MatchBehavior.AGGRESSIVE_LIMIT,
+                match_price=match_price,
+                fill_volume=fill_vol,
+                remaining_volume=max(remaining - fill_vol, 0.0),
+                mid_price=ctx.mid_price,
+                spread=ctx.spread,
+                available_volume=available_vol,
+            )
+
+        # ------------------------------------------------------------------
+        # 主动成交路径（order price 穿越对手盘一档）
+        # ------------------------------------------------------------------
+        if is_long and ctx.ask1 > 0 and order.price >= ctx.ask1:
+            match_price = ctx.ask1
+            available_vol = ctx.ask_vol_1
+            behavior = MatchBehavior.AGGRESSIVE_LIMIT
+
+        elif not is_long and ctx.bid1 > 0 and order.price <= ctx.bid1:
+            match_price = ctx.bid1
+            available_vol = ctx.bid_vol_1
+            behavior = MatchBehavior.AGGRESSIVE_LIMIT
+
+        # ------------------------------------------------------------------
+        # 被动成交路径（last_price 触及挂单价）
+        # ------------------------------------------------------------------
+        elif is_long and ctx.last_price > 0 and ctx.last_price <= order.price:
+            match_price = order.price
+            available_vol = ctx.delta_volume
+            behavior = MatchBehavior.PASSIVE_LIMIT
+
+        elif not is_long and ctx.last_price > 0 and ctx.last_price >= order.price:
+            match_price = order.price
+            available_vol = ctx.delta_volume
+            behavior = MatchBehavior.PASSIVE_LIMIT
+
+        else:
+            return no_fill
+
+        # ------------------------------------------------------------------
+        # 容量裁剪
+        # ------------------------------------------------------------------
+        if fill_mode == FillMode.FULL_VOLUME:
+            fill_vol = remaining
+        elif behavior == MatchBehavior.PASSIVE_LIMIT:
+            # 被动单永远按区间参与率裁剪，不受 FillMode 影响。
+            fill_vol = min(remaining, max(available_vol * participation_rate, 0.0))
+        else:
+            # 主动单默认按一档可见量裁剪。
+            fill_vol = min(remaining, max(available_vol, 0.0))
+
+        if fill_vol <= 0:
+            return no_fill
+
+        return TickExecutionResult(
+            matched=True,
+            behavior=behavior,
+            match_price=match_price,
+            fill_volume=fill_vol,
+            remaining_volume=max(remaining - fill_vol, 0.0),
+            mid_price=ctx.mid_price,
+            spread=ctx.spread,
+            available_volume=available_vol,
+        )
+
+    def match_stop(
+        self,
+        stop_order,  # StopOrder
+        ctx,  # TickExecutionContext
+        fill_mode: FillMode,
+        participation_rate: float = 0.3,
+    ) -> TickExecutionResult:
+        """
+        撮合止损单。
+        触发条件：
+        - 买入止损：last_price >= stop_order.price
+        - 卖出止损：last_price <= stop_order.price
+        触发后以对手盘一档价成交（最差价保护）。
+        """
+        remaining = stop_order.volume
+        no_fill = TickExecutionResult(
+            matched=False,
+            behavior=MatchBehavior.STOP_TRIGGERED,
+            match_price=0.0,
+            fill_volume=0.0,
+            remaining_volume=remaining,
+            mid_price=ctx.mid_price,
+            spread=ctx.spread,
+        )
+
+        is_long = stop_order.direction == Direction.LONG
+        triggered = ((is_long and ctx.last_price > 0 and ctx.last_price >= stop_order.price)
+                     or (not is_long and ctx.last_price > 0 and ctx.last_price <= stop_order.price))
+        if not triggered:
+            return no_fill
+
+        # 触发后吃对手盘一档
+        if is_long:
+            match_price = ctx.ask1 if ctx.ask1 > 0 else ctx.last_price
+            available_vol = ctx.ask_vol_1
+        else:
+            match_price = ctx.bid1 if ctx.bid1 > 0 else ctx.last_price
+            available_vol = ctx.bid_vol_1
+
+        if fill_mode == FillMode.FULL_VOLUME:
+            fill_vol = remaining
+        else:
+            fill_vol = min(remaining, max(available_vol, 0.0))
+
+        if fill_vol <= 0:
+            # 触发但盘口无量，记录触发不成交
+            return TickExecutionResult(
+                matched=True,
+                behavior=MatchBehavior.STOP_TRIGGERED,
+                match_price=match_price,
+                fill_volume=0.0,
+                remaining_volume=remaining,
+                mid_price=ctx.mid_price,
+                spread=ctx.spread,
+                available_volume=available_vol,
+            )
+
+        return TickExecutionResult(
+            matched=True,
+            behavior=MatchBehavior.STOP_TRIGGERED,
+            match_price=match_price,
+            fill_volume=fill_vol,
+            remaining_volume=max(remaining - fill_vol, 0.0),
+            mid_price=ctx.mid_price,
+            spread=ctx.spread,
+            available_volume=available_vol,
+        )

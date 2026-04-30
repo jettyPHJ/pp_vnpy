@@ -1,7 +1,7 @@
 import uuid
 import importlib
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -26,7 +26,7 @@ from vnpy.trader.object import (
     TradeData,
     ContractData,
 )
-from vnpy.trader.event import (EVENT_TICK, EVENT_ORDER, EVENT_TRADE)
+from vnpy.trader.event import (EVENT_TICK, EVENT_ORDER, EVENT_TRADE, EVENT_TIMER)
 from vnpy.trader.constant import (Direction, OrderType, Interval, Exchange, Offset, Status)
 from vnpy.trader.utility import load_json, save_json, extract_vt_symbol, round_to
 from vnpy.trader.database import BaseDatabase, get_database, DB_TZ
@@ -82,15 +82,9 @@ class CtaEngine(BaseEngine):
         self.database: BaseDatabase = get_database()
         self.datafeed: BaseDatafeed = get_datafeed()
 
-        # ==========================================
-        # V1.3 新增：管道组件实例化
-        # ==========================================
         self.risk_manager = DummyRiskManager(reject_keywords={"MALICIOUS_TEST"})
         self.execution_adapter = ExecutionAdapter()
 
-        # ==========================================
-        # V1.3 新增：映射内存与可观测性
-        # ==========================================
         # orderid_chain_map: 仅用于 process_trade_event 时对 O(1) 反向查找 chain_id。
         self.orderid_chain_map: dict[str, str] = {}
 
@@ -101,8 +95,9 @@ class CtaEngine(BaseEngine):
         # 统计指标：静默记录未走 V1.3 管道的底层成交（如止损单触发）
         self.untracked_trade_count: int = 0
 
-        # TODO(Phase 3): 增加审计 Map 的 TTL 清理机制。实盘长期运行有内存泄露风险。
-        # 清理策略建议：按 chain_id 对应成交完结时间做 LRU，或每日盘后定时归档清空。
+        # TTL 计时器与定长归档队列，杜绝 OOM
+        self.timer_count: int = 0
+        self.chain_audit_archive: deque = deque(maxlen=10000)
 
     def _init_chain_audit(self, signal: SignalOrder) -> None:
         """Helper 方法：初始化审计链字典结构，防止拼写错误"""
@@ -129,6 +124,55 @@ class CtaEngine(BaseEngine):
 
         log_engine: LogEngine = self.main_engine.get_engine("log")  # type: ignore
         log_engine.register_log(EVENT_CTA_LOG)
+
+        # [V1.6 升级] 追加定时清理事件，不破坏原有注册体系
+        self.event_engine.register(EVENT_TIMER, self.process_timer_event)
+
+    def process_timer_event(self, event: Event) -> None:
+        self.timer_count += 1
+        if self.timer_count >= 3600:  # 每小时清理一次
+            self.timer_count = 0
+            self.clean_expired_audit_chains(max_age_hours=24)
+
+    def clean_expired_audit_chains(self, max_age_hours: int = 24) -> None:
+        """[V1.6] 终态安全清理与持久化归档"""
+        now = datetime.now()
+        expired_chains = []
+
+        for chain_id, audit_data in list(self.chain_audit_map.items()):
+            signal = audit_data.get("signal")
+            if not signal:
+                continue
+
+            age_seconds = (now - signal.created_at).total_seconds()
+            if age_seconds <= max_age_hours * 3600:
+                continue
+
+            is_terminal = True
+            orders = audit_data.get("orders", [])
+
+            if not orders and audit_data.get("risk") and audit_data.get("risk").decision.name != "REJECT":
+                pass  # 残缺链，算作终态
+            else:
+                for order_ref in orders:
+                    order_data = self.main_engine.get_order(order_ref.vt_orderid)
+                    if order_data and order_data.status not in [Status.ALLTRADED, Status.CANCELLED, Status.REJECTED]:
+                        is_terminal = False
+                        break
+
+            if is_terminal:
+                expired_chains.append(chain_id)
+
+        for chain_id in expired_chains:
+            audit_data = self.chain_audit_map.pop(chain_id)
+            # 写入定长队列归档
+            self.chain_audit_archive.append({"chain_id": chain_id, "data": audit_data, "archived_at": now})
+
+            for order_ref in audit_data.get("orders", []):
+                self.orderid_chain_map.pop(order_ref.vt_orderid, None)
+
+        if expired_chains:
+            self.write_log(f"🧹 [TTL归档] 已释放并归档 {len(expired_chains)} 条终态审计链路。")
 
     def init_datafeed(self) -> None:
         """
@@ -203,24 +247,17 @@ class CtaEngine(BaseEngine):
         if not strategy:
             return
 
-        # ==========================================
-        # V1.3 审计链闭环与可观测性
-        # ==========================================
         chain_id = self.orderid_chain_map.get(trade.vt_orderid)
         if chain_id and chain_id in self.chain_audit_map:
             self.chain_audit_map[chain_id]["trades"].append(trade)
         else:
-            # 静默计数：记录未进入 V1.3 Pipeline 的成交量（不写 log，防刷屏）
             self.untracked_trade_count += 1
 
-        # ==========================================
-        # 唯一真相来源 (Single Source of Truth)
-        # 声明：V1.3 尚未剥离 target_pos，当前的 strategy.pos 逻辑上兼任 actual_pos
-        # ==========================================
-        if trade.direction == Direction.LONG:
-            strategy.pos += trade.volume
-        else:
-            strategy.pos -= trade.volume
+        # [V1.6 升级] 更新净仓位账本，并用 hasattr 兼容过渡
+        pos_change = trade.volume if trade.direction == Direction.LONG else -trade.volume
+        strategy.pos += pos_change
+        if hasattr(strategy, "actual_pos"):
+            strategy.actual_pos += pos_change
 
         self.call_strategy_func(strategy, strategy.on_trade, trade)
         self.sync_strategy_data(strategy)

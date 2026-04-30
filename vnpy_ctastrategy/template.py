@@ -32,8 +32,11 @@ class CtaTemplate(ABC):
         self.trading: bool = False
         self.pos: float = 0
 
-        # Copy a new variables list here to avoid duplicate insert when multiple
-        # strategy instances are created with the same strategy class.
+        # [V1.6 升级] 物理真实净持仓镜像 (纯运行时状态，不由 json 恢复)
+        # 仅作为净持仓对照，暂不区分今昨仓与多空双向账本
+        self.actual_pos: float = 0
+
+        # 严格禁止将 actual_pos 放入 variables，防止断线重连时脏数据污染
         self.variables = copy(self.variables)
         self.variables.insert(0, "inited")
         self.variables.insert(1, "trading")
@@ -140,107 +143,43 @@ class CtaTemplate(ABC):
         """
         return
 
-    def buy(
-        self,
-        price: float,
-        volume: float,
-        stop: bool = False,
-        lock: bool = False,
-        net: bool = False
-    ) -> list:
+    def buy(self, price: float, volume: float, stop: bool = False, lock: bool = False, net: bool = False) -> list:
         """
         Send buy order to open a long position.
         """
-        return self.send_order(
-            Direction.LONG,
-            Offset.OPEN,
-            price,
-            volume,
-            stop,
-            lock,
-            net
-        )
+        return self.send_order(Direction.LONG, Offset.OPEN, price, volume, stop, lock, net)
 
-    def sell(
-        self,
-        price: float,
-        volume: float,
-        stop: bool = False,
-        lock: bool = False,
-        net: bool = False
-    ) -> list:
+    def sell(self, price: float, volume: float, stop: bool = False, lock: bool = False, net: bool = False) -> list:
         """
         Send sell order to close a long position.
         """
-        return self.send_order(
-            Direction.SHORT,
-            Offset.CLOSE,
-            price,
-            volume,
-            stop,
-            lock,
-            net
-        )
+        return self.send_order(Direction.SHORT, Offset.CLOSE, price, volume, stop, lock, net)
 
-    def short(
-        self,
-        price: float,
-        volume: float,
-        stop: bool = False,
-        lock: bool = False,
-        net: bool = False
-    ) -> list:
+    def short(self, price: float, volume: float, stop: bool = False, lock: bool = False, net: bool = False) -> list:
         """
         Send short order to open as short position.
         """
-        return self.send_order(
-            Direction.SHORT,
-            Offset.OPEN,
-            price,
-            volume,
-            stop,
-            lock,
-            net
-        )
+        return self.send_order(Direction.SHORT, Offset.OPEN, price, volume, stop, lock, net)
 
-    def cover(
-        self,
-        price: float,
-        volume: float,
-        stop: bool = False,
-        lock: bool = False,
-        net: bool = False
-    ) -> list:
+    def cover(self, price: float, volume: float, stop: bool = False, lock: bool = False, net: bool = False) -> list:
         """
         Send cover order to close a short position.
         """
-        return self.send_order(
-            Direction.LONG,
-            Offset.CLOSE,
-            price,
-            volume,
-            stop,
-            lock,
-            net
-        )
+        return self.send_order(Direction.LONG, Offset.CLOSE, price, volume, stop, lock, net)
 
-    def send_order(
-        self,
-        direction: Direction,
-        offset: Offset,
-        price: float,
-        volume: float,
-        stop: bool = False,
-        lock: bool = False,
-        net: bool = False
-    ) -> list:
+    def send_order(self,
+                   direction: Direction,
+                   offset: Offset,
+                   price: float,
+                   volume: float,
+                   stop: bool = False,
+                   lock: bool = False,
+                   net: bool = False) -> list:
         """
         Send a new order.
         """
         if self.trading:
-            vt_orderids: list = self.cta_engine.send_order(
-                self, direction, offset, price, volume, stop, lock, net
-            )
+            vt_orderids: list = self.cta_engine.send_order(self, direction, offset, price, volume, stop, lock, net)
             return vt_orderids
         else:
             return []
@@ -283,26 +222,18 @@ class CtaTemplate(ABC):
         """
         return cast(int, self.cta_engine.get_size(self))
 
-    def load_bar(
-        self,
-        days: int,
-        interval: Interval = Interval.MINUTE,
-        callback: Callable | None = None,
-        use_database: bool = False
-    ) -> None:
+    def load_bar(self,
+                 days: int,
+                 interval: Interval = Interval.MINUTE,
+                 callback: Callable | None = None,
+                 use_database: bool = False) -> None:
         """
         Load historical bar data for initializing strategy.
         """
         if not callback:
             callback = self.on_bar
 
-        bars: list[BarData] = self.cta_engine.load_bar(
-            self.vt_symbol,
-            days,
-            interval,
-            callback,
-            use_database
-        )
+        bars: list[BarData] = self.cta_engine.load_bar(self.vt_symbol, days, interval, callback, use_database)
 
         for bar in bars:
             callback(bar)
@@ -375,13 +306,7 @@ class TargetPosTemplate(CtaTemplate):
     last_bar: BarData | None = None
     target_pos = 0
 
-    def __init__(
-        self,
-        cta_engine: Any,
-        strategy_name: str,
-        vt_symbol: str,
-        setting: dict
-    ) -> None:
+    def __init__(self, cta_engine: Any, strategy_name: str, vt_symbol: str, setting: dict) -> None:
         """"""
         super().__init__(cta_engine, strategy_name, vt_symbol, setting)
 

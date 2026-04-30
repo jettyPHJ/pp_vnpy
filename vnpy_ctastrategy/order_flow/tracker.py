@@ -25,6 +25,7 @@ class IntentTracker:
             "executions": [],
             "orders": [],
             "trades": [],
+            "cancellations": [],  # V1.6：BAR_END / 手动撤单的审计记录
             "created_at": signal.created_at
         }
 
@@ -64,6 +65,12 @@ class IntentTracker:
         slippage_result=None,
         commission_result=None,
         contract_multiplier: float = 1.0,
+        # V1.6 Tick 撮合专用审计字段
+        tick_fill_mode=None,
+        tick_fill_volume: float = None,
+        tick_remaining: float = None,
+        tick_mid_price: float = None,
+        tick_mid_offset: float = None,
     ) -> None:
         if trade.vt_tradeid in self.exempt_tradeids:
             return
@@ -79,8 +86,36 @@ class IntentTracker:
             "slippage_result": slippage_result,
             "commission_result": commission_result,
             "contract_multiplier": contract_multiplier,
+            # V1.6 Tick 审计字段（Bar 路径均为 None，便于 validator 区分）
+            "tick_fill_mode": tick_fill_mode,
+            "tick_fill_volume": tick_fill_volume,
+            "tick_remaining": tick_remaining,
+            "tick_mid_price": tick_mid_price,
+            "tick_mid_offset": tick_mid_offset,
         }
         self.chain_audit_map[chain_id]["trades"].append(trade_record)
+        self.try_archive(chain_id)
+
+    def record_cancellation(
+        self,
+        order,
+        reason: str = "",
+        remaining_volume: float = 0.0,
+        cancelled_at=None,
+    ) -> None:
+        """
+        V1.6：记录撤单事件到对应 chain 的 cancellations 列表。
+        reason 统一使用常量字符串，例如 "TIF_BAR_END_EXPIRED"。
+        """
+        chain_id = self.orderid_chain_map.get(getattr(order, "vt_orderid", ""))
+        if not chain_id or chain_id not in self.chain_audit_map:
+            return
+        self.chain_audit_map[chain_id]["cancellations"].append({
+            "order": order,
+            "reason": reason,
+            "remaining_volume": remaining_volume,
+            "cancelled_at": cancelled_at or datetime.now(),
+        })
         self.try_archive(chain_id)
 
     def record_standalone_trade(

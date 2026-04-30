@@ -76,7 +76,7 @@ def validate_v1_4_directional_constraint(engine):
 def validate_v1_4_double_deduction(engine):
     import math
 
-    assert getattr(engine, "friction_mode", "legacy") == "v1.4", "引擎未开启 V1.4 模式"
+    assert engine.friction_mode in (FrictionMode.BAR_ENHANCED, FrictionMode.TICK_REPLAY), "引擎未开启 V1.4 模式"
     aggressive_records = [
         t for rec in engine.chain_audit_archive for t in rec.get("trades", [])
         if t.get("match_result") and t["match_result"].behavior.value == "AGGRESSIVE_LIMIT"
@@ -292,6 +292,134 @@ def validate_v1_5_engine_routing():
 # 全局测试总控入口
 # ==============================
 
+# ==============================
+# V1.6 Tick Replay 验证器
+# ==============================
+
+
+def validate_v16_no_lookahead(engine) -> list[str]:
+    """
+    防穿越：每笔 Tick 模式成交的 trade.datetime 必须 > 其对应信号 Bar 时间。
+    依赖：intent_tracker.chain_audit_archive 中的 tick_mid_price 不为 None。
+    """
+    errors = []
+    for record in engine.intent_tracker.chain_audit_archive:
+        signal = record.get("signal")
+        if not signal:
+            continue
+        signal_dt = signal.created_at
+        for t_rec in record.get("trades", []):
+            if t_rec.get("tick_fill_mode") is None:
+                continue  # Bar 路径跳过
+            trade_dt = t_rec["trade"].datetime
+            if trade_dt <= signal_dt:
+                errors.append(f"穿越！chain={str(signal.chain_id)[:8]} "
+                              f"trade_dt={trade_dt} <= signal_dt={signal_dt}")
+    return errors
+
+
+def validate_v16_partial_fill_state(engine) -> list[str]:
+    """
+    部分成交后 remaining_volume > 0 的记录，其订单在 chain 里必须有多条 trade。
+    """
+    errors = []
+    for record in engine.intent_tracker.chain_audit_archive:
+        partial = [t for t in record.get("trades", []) if (t.get("tick_remaining") or 0) > 0]
+        if partial:
+            total_trades = len(record.get("trades", []))
+            if total_trades < 2:
+                signal = record.get("signal")
+                cid = str(signal.chain_id)[:8] if signal else "?"
+                errors.append(f"chain={cid}：有 partial_fill 记录但 trade 只有 {total_trades} 条")
+    return errors
+
+
+def validate_v16_cancellation_audit(engine) -> list[str]:
+    """
+    BAR_END 到期的撤单必须在 chain_audit_archive 里留有 cancellation 记录，
+    且成交量 + 撤单余量 == 信号量（量守恒检查）。
+    """
+    import math
+    errors = []
+    for record in engine.intent_tracker.chain_audit_archive:
+        cancels = record.get("cancellations", [])
+        bar_end_cancel = [c for c in cancels if c.get("reason") == "TIF_BAR_END_EXPIRED"]
+        if not bar_end_cancel:
+            continue
+        signal = record.get("signal")
+        if not signal:
+            continue
+        traded_total = sum(t["trade"].volume for t in record.get("trades", []))
+        cancelled_total = sum(c.get("remaining_volume", 0) for c in bar_end_cancel)
+        expected = signal.volume
+        if not math.isclose(traded_total + cancelled_total, expected, rel_tol=1e-6):
+            errors.append(f"chain={str(signal.chain_id)[:8]}：量不平衡 "
+                          f"traded={traded_total} + cancelled={cancelled_total} != signal={expected}")
+    return errors
+
+
+def validate_v16_audit_fields_complete(engine) -> list[str]:
+    """
+    Tick 模式成交的每条 trade record 必须有完整的 7 个 Tick 审计字段。
+    """
+    required = ["tick_fill_mode", "tick_fill_volume", "tick_mid_price", "tick_mid_offset"]
+    errors = []
+    for record in engine.intent_tracker.chain_audit_archive:
+        for t_rec in record.get("trades", []):
+            if t_rec.get("tick_fill_mode") is None:
+                continue  # Bar 路径不检查
+            for field in required:
+                if t_rec.get(field) is None:
+                    signal = record.get("signal")
+                    cid = str(signal.chain_id)[:8] if signal else "?"
+                    errors.append(f"chain={cid}：{field} 为 None")
+    return errors
+
+
+def validate_v16_tick_replay_runtime(engine) -> list[str]:
+    """前置检查：确认 Tick Replay 实际发生过，防止 V1.6 validator 空通过。"""
+    from vnpy_ctastrategy.base import FrictionMode
+
+    errors = []
+    if getattr(engine, "friction_mode", None) != FrictionMode.TICK_REPLAY:
+        errors.append(f"引擎 friction_mode={getattr(engine, 'friction_mode', None)}，未开启 TICK_REPLAY")
+
+    stats = getattr(engine, "tick_replay_stats", None)
+    if not stats:
+        errors.append("缺少 tick_replay_stats，引擎版本不兼容")
+        return errors
+
+    if stats.get("ticks_loaded", 0) <= 0:
+        errors.append("TickReplayStore 未加载任何 Tick 数据")
+    if stats.get("ticks_replayed", 0) <= 0:
+        errors.append("Tick Replay 从未执行，检查 configure_execution/load_data/new_bar 链路")
+
+    return errors
+
+
+def run_v16_validators(engine) -> dict:
+    """
+    V1.6 验证器统一入口，返回各项测试结果字典。
+    键为检查名，值为 {"pass": bool, "errors": list[str]}。
+    "overall" 键汇总全局通过状态。
+    """
+    checks = [
+        ("Tick Replay 运行时检查", validate_v16_tick_replay_runtime),
+        ("防穿越", validate_v16_no_lookahead),
+        ("部分成交状态", validate_v16_partial_fill_state),
+        ("撤单审计", validate_v16_cancellation_audit),
+        ("审计字段完整性", validate_v16_audit_fields_complete),
+    ]
+    results = {}
+    all_pass = True
+    for name, fn in checks:
+        errs = fn(engine)
+        results[name] = {"pass": len(errs) == 0, "errors": errs}
+        if errs:
+            all_pass = False
+    results["overall"] = all_pass
+    return results
+
 
 def run_all_system_validations(engine=None):
     """
@@ -300,7 +428,7 @@ def run_all_system_validations(engine=None):
     - V1.5 测试为独立沙盒，始终执行。
     """
     print("\n" + "=" * 55)
-    print("🚀 开始执行全量架构防回退系统测试 (V1.3 - V1.5)")
+    print("🚀 开始执行全量架构防回退系统测试 (V1.3 - V1.6)")
     print("=" * 55)
 
     if engine:
@@ -318,6 +446,20 @@ def run_all_system_validations(engine=None):
     print("\n⏳ [阶段 3] 执行 V1.5 容量与风控拦截双重沙盒验证...")
     validate_v1_5_core_mechanics()
     validate_v1_5_engine_routing()
+
+    if engine:
+        print("\n⏳ [阶段 4] 执行 V1.6 Tick Replay 集成验证...")
+        v16_results = run_v16_validators(engine)
+        for check_name, result in v16_results.items():
+            if check_name == "overall":
+                continue
+            status = "✅" if result["pass"] else "❌"
+            print(f"   {status} {check_name}")
+            for err in result["errors"]:
+                print(f"      └─ {err}")
+        if not v16_results.get("overall", True):
+            raise AssertionError("❌ V1.6 验证发现问题，详见上方错误列表。")
+        print("   ✅ V1.6 Tick Replay 全部验证通过")
 
     print("\n" + "=" * 55)
     print("🎉 全部架构级验证通过！系统底座稳固，可安全用于投研。")

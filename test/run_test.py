@@ -9,7 +9,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 import config as cfg
-from vnpy_ctastrategy.backtesting import BacktestingEngine
+from vnpy_ctastrategy.backtesting import BacktestingEngine, load_tick_data
 from report_builder import generate_web_report
 from system_validator import run_all_system_validations
 
@@ -21,23 +21,72 @@ from vnpy_ctastrategy.strategies.v13_mock_strategy import V13MockStrategy
 from vnpy_ctastrategy.base import ExecutionProfile
 
 
+def _split_vt_symbol(vt_symbol: str) -> tuple[str, Exchange]:
+    """拆分 vt_symbol，返回 symbol 与 Exchange 枚举。"""
+    symbol, exchange_str = vt_symbol.split(".")
+    return symbol, Exchange(exchange_str)
+
+
+def print_v16_symbol_topology(signal_vt_symbol: str) -> None:
+    """打印 V1.6 的信号层/执行层分离关系，避免误把 rb888 当执行合约。"""
+    print("=" * 72)
+    print("🧭 V1.6 测试拓扑")
+    print(f"📈 信号标的 / 连续合约: {signal_vt_symbol}")
+    print("🧱 物理执行合约池:")
+    for vt_sym in cfg.PHYSICAL_SYMBOLS:
+        print(f"   - {vt_sym}")
+    print("说明：策略可以继续读取 rb888.SHFE 的连续 Bar 信号；")
+    print("      Tick Replay 执行层必须使用上面的物理合约 Tick。")
+    print("=" * 72)
+
+
+def inspect_local_tick_data() -> int:
+    """检查本地数据库中物理合约 Tick 数量；不下载，只检查。"""
+    total_ticks = 0
+    print("\n" + "=" * 72)
+    print("🔎 检查本地物理合约 Tick 数据...")
+    for vt_symbol in cfg.PHYSICAL_SYMBOLS:
+        try:
+            symbol, exchange = _split_vt_symbol(vt_symbol)
+            ticks = load_tick_data(
+                symbol,
+                exchange,
+                cfg.START_DATE - timedelta(days=cfg.WARMUP_DAYS),
+                cfg.END_DATE,
+            )
+            count = len(ticks or [])
+            total_ticks += count
+            icon = "✅" if count > 0 else "⚠️"
+            print(f"{icon} {vt_symbol}: {count} ticks")
+        except Exception as exc:
+            print(f"❌ {vt_symbol}: Tick 检查失败 | {exc}")
+    print(f"📊 本地物理 Tick 总数: {total_ticks}")
+    if total_ticks <= 0:
+        print("⚠️ 未发现物理合约 Tick。V1.6 runtime validator 会失败，这是正确的保护。")
+        print("   你需要先把 rb2405/rb2410/... 等物理合约 Tick 写入 vn.py 数据库。")
+    print("=" * 72 + "\n")
+    return total_ticks
+
+
 def download_data(route: dict = None) -> None:
-    """根据配置同步历史数据。
-    对当前连续合约框架，只强制下载物理合约数据；
-    连续符号 rb888.SHFE 由 ContinuousBuilder 在引擎内部拼接，不依赖数据源直接提供。
+    """根据配置同步历史 Bar 数据。
+
+    注意：这里同步的是物理合约 Bar 数据，用于连续合约构造与路由。
+    V1.6 Tick Replay 还需要物理合约 Tick 数据；常规 datafeed 未必支持 tick 下载，
+    因此这里不假设可以自动下载 Tick，只在回测前用 inspect_local_tick_data() 检查本地库。
     """
     datafeed = get_datafeed()
     database = get_database()
 
     symbols = list(cfg.PHYSICAL_SYMBOLS)
 
-    print("=" * 60)
-    print("📥 开始下载/同步历史数据...")
+    print("=" * 72)
+    print("📥 开始下载/同步物理合约 Bar 数据...")
     for vt_symbol in symbols:
-        s, e_str = vt_symbol.split(".")
+        s, e = _split_vt_symbol(vt_symbol)
         req = HistoryRequest(
             symbol=s,
-            exchange=Exchange(e_str),
+            exchange=e,
             start=cfg.START_DATE - timedelta(days=cfg.WARMUP_DAYS),
             end=cfg.END_DATE,
             interval=cfg.INTERVAL,
@@ -47,13 +96,13 @@ def download_data(route: dict = None) -> None:
             data = datafeed.query_bar_history(req)
             if data:
                 database.save_bar_data(data)
-                print(f"✅ 已同步: {vt_symbol} | {len(data)} 条")
+                print(f"✅ 已同步 Bar: {vt_symbol} | {len(data)} 条")
             else:
-                print(f"⚠️ 未获取到数据: {vt_symbol}")
-        except Exception as e:
-            print(f"❌ 下载失败: {vt_symbol} | {e}")
-    print("📦 历史数据同步结束")
-    print("=" * 60)
+                print(f"⚠️ 未获取到 Bar: {vt_symbol}")
+        except Exception as exc:
+            print(f"❌ Bar 下载失败: {vt_symbol} | {exc}")
+    print("📦 物理合约 Bar 数据同步结束")
+    print("=" * 72)
 
 
 def run_backtest_with_config(strategy_class, setting: dict, vt_symbol: str):
@@ -73,14 +122,20 @@ def run_backtest_with_config(strategy_class, setting: dict, vt_symbol: str):
                           warmup_days=cfg.WARMUP_DAYS)
 
     # 2. 配置物理仿真执行环境
+    # V1.6：必须在 load_data() 前启用 Tick Replay，否则物理 Tick 不会被加载进 TickReplayStore。
     engine.configure_execution(profile=ExecutionProfile.REALISTIC,
                                margin_rate=0.10,
                                max_order_size=50.0,
                                max_participation_rate=0.15,
-                               impact_factor=1.5)
+                               impact_factor=1.5,
+                               use_tick_replay=True)
 
     engine.add_strategy(strategy_class, setting)
     engine.load_data()
+
+    stats = getattr(engine, "tick_replay_stats", {})
+    if stats:
+        print("📊 TickReplayStore 加载统计:", stats)
 
     # 数据加载失败拦截
     if getattr(engine, "data_load_failed", False):
@@ -96,7 +151,7 @@ def run_backtest_with_config(strategy_class, setting: dict, vt_symbol: str):
         print(f"❌ 回测执行过程中发生异常: {error_msg}。拒绝生成残缺报表！")
         sys.exit(1)
 
-    # ── 架构级系统验证（V1.3 ~ V1.5 全量防回退测试）────────────────────────
+    # ── 架构级系统验证（V1.3 ~ V1.6 全量防回退测试）────────────────────────
     # 必须在 calculate_result() 之前执行，此时引擎交易数据最完整。
     # 传入 engine 实例，V1.3/V1.4 验证器才能拿到真实的 trades / chain_audit_archive。
     print("\n" + "─" * 60)
@@ -144,7 +199,13 @@ if __name__ == "__main__":
         setting = {}
         target_vt_symbol = "rb888.SHFE"
 
-    print(f"▶️ 当前执行策略: {strategy_class.__name__} | 标的合约: {target_vt_symbol}")
+    print(f"▶️ 当前执行策略: {strategy_class.__name__}")
+    print_v16_symbol_topology(target_vt_symbol)
+
+    if getattr(cfg, "AUTO_DOWNLOAD", False):
+        download_data(route if 'route' in locals() else None)
+
+    inspect_local_tick_data()
 
     # 3. 传入正确的类、参数和标的启动回测
     run_backtest_with_config(strategy_class, setting, target_vt_symbol)
